@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-Acoustic + RF Drone Detector
-Optimized for NVIDIA Jetson Nano with TP-Link (wlxb8fbb3c4e916).
-
-Combines two independent detection methods:
-  1. ACOUSTIC — microphone FFT analysis for drone motor/propeller signatures
-  2. RF       — WiFi monitor mode (Scapy) for drone control/video SSIDs & OUIs
-
-Either method alone can trigger a detection. Both run in parallel threads.
+Acoustic Drone Detector
+Optimized for NVIDIA Jetson Nano with microphone FFT analysis.
 
 Acoustic detection works by identifying the harmonic frequency pattern that
 multi-rotor drones produce. Each motor spins a propeller, generating a
@@ -19,45 +13,78 @@ A drone is flagged when >= MIN_HARMONIC_PEAKS evenly-spaced peaks appear in
 the FFT with consistent spacing (harmonic series) and sufficient energy ratio.
 
 Requirements:
-    pip3 install scapy pyaudio numpy scipy
-    sudo apt update && sudo apt install aircrack-ng portaudio19-dev
+    pip3 install pyaudio numpy scipy
+    sudo apt update && sudo apt install portaudio19-dev
 
 Usage:
     sudo python3 acoustic_drone_detector.py
-    sudo python3 acoustic_drone_detector.py --iface wlxb8fbb3c4e916mon --audio-device 0
+    sudo python3 acoustic_drone_detector.py --audio-device 0
     sudo python3 acoustic_drone_detector.py --list-audio   # list microphone devices
-    sudo python3 acoustic_drone_detector.py --no-rf        # acoustic only
-    sudo python3 acoustic_drone_detector.py --no-acoustic  # RF only
 """
 
 import argparse
 import time
 import threading
 import queue
-import subprocess
 from datetime import datetime
 from collections import deque
 import sys
-import math
-
-# ── RF dependencies ──────────────────────────────────────────────────────────
-try:
-    from scapy.all import sniff, Dot11, Dot11Beacon, Dot11ProbeReq, Dot11ProbeResp
-    RF_AVAILABLE = True
-except ImportError:
-    RF_AVAILABLE = False
-    print("⚠️  Scapy not installed — RF detection disabled.")
-    print("   Run: pip3 install scapy && sudo apt install aircrack-ng")
+import warnings
 
 # ── Acoustic dependencies ────────────────────────────────────────────────────
+NUMPY_AVAILABLE = False
+SCIPY_AVAILABLE = False
 try:
     import numpy as np
-    from scipy.signal import find_peaks
     NUMPY_AVAILABLE = True
 except ImportError:
-    NUMPY_AVAILABLE = False
-    print("⚠️  numpy/scipy not installed — acoustic detection disabled.")
-    print("   Run: pip3 install numpy scipy")
+    print("⚠️  NumPy not installed — acoustic detection disabled.")
+    print("   Run: pip3 install numpy")
+except Exception as e:
+    print("⚠️  NumPy import failed — acoustic detection disabled.")
+    print(f"   Error: {e}")
+    print("   Run: pip3 install numpy")
+
+def _numpy_find_peaks(x, prominence=1, distance=1):
+    x = np.asarray(x, dtype=np.float64)
+    if x.size == 0:
+        return np.array([], dtype=int), {}
+
+    distance = max(1, int(distance))
+    peaks = []
+    for i in range(1, len(x) - 1):
+        if x[i] > x[i - 1] and x[i] >= x[i + 1]:
+            peaks.append(i)
+
+    filtered = []
+    last = -distance - 1
+    for idx in peaks:
+        if idx - last < distance:
+            continue
+        left = max(0, idx - distance)
+        right = min(len(x), idx + distance + 1)
+        left_min = np.min(x[left:idx + 1]) if idx > 0 else x[idx]
+        right_min = np.min(x[idx:right]) if idx < len(x) - 1 else x[idx]
+        baseline = max(left_min, right_min)
+        if x[idx] - baseline >= prominence:
+            filtered.append(idx)
+            last = idx
+
+    return np.array(filtered, dtype=int), {}
+
+if NUMPY_AVAILABLE:
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            from scipy.signal import find_peaks
+        SCIPY_AVAILABLE = True
+    except Exception as e:
+        print("⚠️  SciPy unavailable — falling back to NumPy peak detector.")
+        print(f"   Error: {e}")
+        print("   If you want the higher-quality peak finder, install a compatible SciPy:")
+        print("   pip3 install scipy")
+        SCIPY_AVAILABLE = False
+        find_peaks = _numpy_find_peaks
 
 try:
     import pyaudio
@@ -65,6 +92,11 @@ try:
 except ImportError:
     PYAUDIO_AVAILABLE = False
     print("⚠️  PyAudio not installed — acoustic detection disabled.")
+    print("   Run: pip3 install pyaudio  (needs: sudo apt install portaudio19-dev)")
+except Exception as e:
+    PYAUDIO_AVAILABLE = False
+    print("⚠️  PyAudio import failed — acoustic detection disabled.")
+    print(f"   Error: {e}")
     print("   Run: pip3 install pyaudio  (needs: sudo apt install portaudio19-dev)")
 
 
@@ -76,25 +108,33 @@ SAMPLE_RATE       = 44100   # Hz — standard mic sample rate
 CHUNK_SIZE        = 4096    # samples per FFT frame (~93 ms at 44100 Hz)
 AUDIO_CHANNELS    = 1       # mono
 
-# Frequency window where drone propeller fundamentals live (Hz)
+# Notes:
+# - CHUNK_SIZE controls time vs frequency resolution for the FFT. Larger
+#   chunks give finer frequency resolution but more latency; 4096 is a
+#   reasonable balance for short drone blade tones in-room.
+# Frequency window where drone propeller fundamentals and motor harmonics live (Hz)
 DRONE_FREQ_LOW    = 80
-DRONE_FREQ_HIGH   = 800     # narrowed: drone fundamentals only, avoids USB/electrical HF noise
+DRONE_FREQ_HIGH   = 2000    # broader band to capture fundamentals, harmonics, and frame resonance
 
 # A peak must be this many dB above the local noise floor to count
-PEAK_PROMINENCE   = 20      # dB  (raised from 12 — peaks must really stand out)
+PEAK_PROMINENCE   = 12      # dB  (default sensitivity for tonal drone peaks)
 
 # How many harmonic peaks we need to classify as a drone
-MIN_HARMONIC_PEAKS = 5      # (raised from 3 — requires a fuller harmonic series)
+MIN_HARMONIC_PEAKS = 3      # requires a fuller harmonic series, but allows quieter drones
 
 # Maximum allowed deviation between measured harmonic spacing and ideal (%)
-HARMONIC_TOLERANCE = 0.10   # 10 %  (tightened from 15 — less tolerance for irregular spacing)
+HARMONIC_TOLERANCE = 0.15   # 15 %  (allows more real-world harmonic drift)
 
 # The total energy in the drone band must be this fraction of full-spectrum
 # energy (filters out silence / very quiet background)
-MIN_ENERGY_RATIO  = 0.35    # (raised from 0.15 — drone must dominate the spectrum)
+MIN_ENERGY_RATIO  = 0.15    # (lowered to accept quieter drone tones)
+
+# Acoustic debug prints extra FFT/peak information to help tune detection
+ACOUSTIC_DEBUG        = False
+ACOUSTIC_SPECTROGRAM  = False
 
 # How many consecutive positive frames before we fire an alert
-CONFIRM_FRAMES    = 4       # (raised from 2 — signal must persist ~370 ms)
+CONFIRM_FRAMES    = 2       # shorter confirmation window for faster detection
 
 # Ring buffer length for acoustic detections displayed in the summary
 ACOUSTIC_HISTORY  = 30
@@ -119,7 +159,10 @@ class AcousticDroneDetector:
     """
 
     def __init__(self, device_index=None, detections_queue=None):
-        self.device_index   = device_index
+        # If no device specified, auto-detect a camera microphone.
+        # Preserve explicit 0 device index as a valid selection.
+        self.explicit_device_index = device_index is not None
+        self.device_index = device_index if self.explicit_device_index else find_camera_microphone()
         self.detections     = detections_queue or queue.Queue(maxsize=50)
         self.running        = False
         self._thread        = None
@@ -131,20 +174,54 @@ class AcousticDroneDetector:
             "alerts":          0,
         }
 
+        # `detections` is a shared queue used by RF + acoustic detectors to
+        # publish human-readable detection dictionaries to the main loop.
+        # Keeping it bounded prevents unbounded memory growth under flood.
     # ── public API ────────────────────────────────────────────────────────────
 
     def start(self):
         if not (NUMPY_AVAILABLE and PYAUDIO_AVAILABLE):
-            print("❌ Acoustic detection unavailable (missing numpy/scipy/pyaudio).")
+            print("❌ Acoustic detection unavailable (missing or incompatible numpy/pyaudio).")
             return False
         self.running = True
         self._thread = threading.Thread(target=self._audio_loop, daemon=True)
         self._thread.start()
+        if not SCIPY_AVAILABLE:
+            print("⚠️  SciPy unavailable; using NumPy peak detector fallback.")
         print("🎙️  Acoustic drone detector running...")
         return True
 
     def stop(self):
         self.running = False
+
+    def _render_spectrogram(self, band_freqs, band_db, peaks_idx):
+        if len(band_freqs) == 0:
+            return
+
+        bins = 40
+        edges = np.linspace(band_freqs[0], band_freqs[-1], bins + 1)
+        bin_db = np.full(bins, -100.0, dtype=np.float32)
+        for i in range(bins):
+            mask = (band_freqs >= edges[i]) & (band_freqs < edges[i + 1])
+            if np.any(mask):
+                bin_db[i] = np.mean(band_db[mask])
+
+        db_max = np.max(bin_db)
+        db_min = max(np.min(bin_db), db_max - 40.0)
+        chars = " .:-=+*#@"
+        line = []
+        for val in bin_db:
+            level = int(np.clip((val - db_min) / (db_max - db_min + 1e-6) * (len(chars) - 1),
+                                 0, len(chars) - 1))
+            line.append(chars[level])
+
+        if len(peaks_idx) > 0:
+            peak_bins = np.digitize(band_freqs[peaks_idx], edges) - 1
+            peak_bins = np.clip(peak_bins, 0, bins - 1)
+            for b in np.unique(peak_bins):
+                line[b] = "|"
+
+        print(f"[spec] {''.join(line)}  {band_freqs[0]:.0f}-{band_freqs[-1]:.0f} Hz")
 
     # ── internal ──────────────────────────────────────────────────────────────
 
@@ -160,7 +237,11 @@ class AcousticDroneDetector:
                 input_device_index= self.device_index,
                 frames_per_buffer = CHUNK_SIZE,
             )
-            print(f"   Microphone open (device {self.device_index or 'default'}, "
+            if self.explicit_device_index:
+                device_label = f"device {self.device_index} (explicit)"
+            else:
+                device_label = f"device {self.device_index}" if self.device_index is not None else "system default"
+            print(f"   Microphone open ({device_label}, "
                   f"{SAMPLE_RATE} Hz, chunk {CHUNK_SIZE})")
             while self.running:
                 try:
@@ -187,6 +268,8 @@ class AcousticDroneDetector:
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32)
         samples /= 32768.0
 
+        # Window the samples to reduce spectral leakage before the FFT. A
+        # Hann window is a good default for tonal analysis.
         # Apply a Hann window to reduce spectral leakage
         window  = np.hanning(len(samples))
         samples = samples * window
@@ -207,7 +290,12 @@ class AcousticDroneDetector:
         band_energy  = np.sum(magnitude[band_mask] ** 2)
         energy_ratio = band_energy / (total_energy + 1e-10)
 
+        # If the band doesn't carry enough energy compared with the full
+        # spectrum, it's unlikely a drone is present (helps avoid false
+        # positives in quiet rooms or when other broadband noise dominates).
         if energy_ratio < MIN_ENERGY_RATIO:
+            if ACOUSTIC_DEBUG:
+                print(f"[debug] energy_ratio={energy_ratio:.3f} below MIN_ENERGY_RATIO={MIN_ENERGY_RATIO}")
             self._confirm_count = 0
             return
 
@@ -215,20 +303,36 @@ class AcousticDroneDetector:
         band_db    = db[band_mask]
         band_freqs = freqs[band_mask]
 
-        # find_peaks works on the band-limited spectrum
+        # find_peaks works on the band-limited spectrum. We look for
+        # prominent narrowband peaks (tonal components) that could be the
+        # propeller fundamental and its harmonics.
         peaks_idx, props = find_peaks(
             band_db,
             prominence = PEAK_PROMINENCE,
             distance   = int(len(band_freqs) * 0.02),  # ≥2% band apart
         )
 
+        if ACOUSTIC_DEBUG:
+            peak_freqs_debug = band_freqs[peaks_idx] if len(peaks_idx) > 0 else []
+            print(f"[debug] frame={self.stats['frames_analysed']} energy_ratio={energy_ratio:.3f} peaks={len(peaks_idx)} "
+                  f"prom={PEAK_PROMINENCE} fund_range={DRONE_FREQ_LOW}-{DRONE_FREQ_HIGH} "
+                  f"peak_freqs={peak_freqs_debug}")
+
         if len(peaks_idx) < MIN_HARMONIC_PEAKS:
             self._confirm_count = 0
+            if ACOUSTIC_SPECTROGRAM:
+                self._render_spectrogram(band_freqs, band_db, peaks_idx)
             return
 
         peak_freqs = band_freqs[peaks_idx]
 
+        if ACOUSTIC_SPECTROGRAM:
+            self._render_spectrogram(band_freqs, band_db, peaks_idx)
+
         # ── Harmonic series check ────────────────────────────────────────────
+        # For each candidate fundamental we check whether integer multiples of
+        # that frequency (2x, 3x, …) also appear as peaks. A real multi-rotor
+        # drone produces a harmonic series; random noises typically do not.
         best_count    = 0
         best_fund     = 0.0
 
@@ -249,6 +353,9 @@ class AcousticDroneDetector:
                 best_count = count
                 best_fund  = candidate_fund
 
+        # Decide whether we have enough harmonics to consider this a drone.
+        # `MIN_HARMONIC_PEAKS` is the tunable threshold for how many harmonics
+        # must be present (including the fundamental).
         is_drone = best_count >= MIN_HARMONIC_PEAKS
 
         if is_drone:
@@ -258,6 +365,8 @@ class AcousticDroneDetector:
             self._confirm_count = 0
 
         # ── Fire alert after CONFIRM_FRAMES consecutive positives ────────────
+        # The confirmation window reduces spurious alerts from single-frame
+        # glitches — we require a short persistence before publishing.
         if self._confirm_count >= CONFIRM_FRAMES:
             self._confirm_count = 0   # reset so we don't spam
             self.stats["alerts"] += 1
@@ -297,183 +406,45 @@ class AcousticDroneDetector:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RF detector  (unchanged logic, merged into shared detection queue)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class RFDroneDetector:
-    def __init__(self, monitor_iface=None, channel_hop=True, detections_queue=None):
-        self.channel_hop = channel_hop
-        self.running     = False
-        self._thread     = None
-        self.detections  = detections_queue or queue.Queue(maxsize=50)
-
-        self.drone_ssids = ["DJI_", "PHANTOM", "MAVIC", "AIR", "MINI", "PARROT",
-                            "BEBOP", "ANAFI", "FPV_", "DRONE", "RC_", "SKY", "TELLO"]
-        self.drone_ouis  = ["60:60:1F", "48:1C:B9", "34:D2:62", "A0:14:3D",
-                            "90:3A:E6", "18:60:24", "BC:8B:B2", "C4:7C:8D"]
-
-        self.recent_drones = deque(maxlen=30)
-        self.stats = {"beacons": 0, "probes": 0, "drones": 0}
-
-        self.monitor_iface = monitor_iface or self._find_usb_wifi_adapter()
-
-    def _find_usb_wifi_adapter(self):
-        try:
-            lsusb_out = subprocess.check_output(["lsusb"], text=True,
-                                                 stderr=subprocess.DEVNULL)
-            if "2357:0138" in lsusb_out or "TP-Link" in lsusb_out:
-                print("✅ TP-Link USB WiFi adapter detected")
-
-            out = subprocess.check_output(["iwconfig"], text=True,
-                                           stderr=subprocess.DEVNULL)
-            wireless_ifaces = []
-            for line in out.splitlines():
-                if line.strip() and not line.startswith(" "):
-                    iface = line.split()[0].strip()
-                    if iface in ["lo", "can0", "l4tbr0", "usb0", "usb1",
-                                 "enP8p1s0", "br-", "docker0"]:
-                        continue
-                    if "no wireless extensions" not in line:
-                        wireless_ifaces.append(iface)
-
-            for iface in wireless_ifaces:
-                if iface.startswith("wlx") or (iface.startswith("wlan")
-                                                and iface != "wlan0"):
-                    print(f"✅ Using USB WiFi adapter: {iface}")
-                    return f"{iface}mon"
-            if wireless_ifaces:
-                return f"{wireless_ifaces[0]}mon"
-            return "wlan0mon"
-        except Exception as e:
-            print(f"⚠️  Adapter detection issue: {e}")
-            return "wlan0mon"
-
-    def setup_monitor_mode(self):
-        print(f"🔧 Setting up monitor mode on {self.monitor_iface}...")
-        try:
-            subprocess.run(["sudo", "airmon-ng", "check", "kill"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            base = self.monitor_iface.replace("mon", "")
-            subprocess.run(["sudo", "airmon-ng", "start", base],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            iw_out = subprocess.check_output(["iwconfig"], text=True,
-                                              stderr=subprocess.DEVNULL)
-            if "Mode:Monitor" in iw_out or self.monitor_iface in iw_out:
-                print(f"✅ Monitor mode ready on {self.monitor_iface}")
-                return True
-            print("⚠️  Monitor mode may not be active.")
-            return False
-        except Exception as e:
-            print(f"❌ Monitor mode setup failed: {e}")
-            return False
-
-    def _packet_handler(self, pkt):
-        if not pkt.haslayer(Dot11):
-            return
-        try:
-            mac, ssid = None, None
-
-            if pkt.haslayer(Dot11Beacon):
-                self.stats["beacons"] += 1
-                ssid = pkt[Dot11Beacon].info.decode(errors='ignore').strip()
-                mac  = pkt.addr2
-            elif pkt.haslayer(Dot11ProbeReq) or pkt.haslayer(Dot11ProbeResp):
-                self.stats["probes"] += 1
-                if pkt.haslayer(Dot11ProbeReq):
-                    ssid = pkt[Dot11ProbeReq].info.decode(errors='ignore').strip()
-                mac = pkt.addr2 or pkt.addr1
-
-            if not mac:
-                return
-
-            mac_upper = mac.upper()
-            oui       = mac_upper[:8]
-            is_drone  = (
-                any(mac_upper.startswith(o) for o in self.drone_ouis) or
-                (ssid and any(d in ssid.upper() for d in self.drone_ssids))
-            )
-
-            if is_drone:
-                self.stats["drones"] += 1
-                key = f"{mac}_{ssid}"
-                if key not in self.recent_drones:
-                    self.recent_drones.append(key)
-                    detection = {
-                        "source":    "RF",
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "mac":       mac,
-                        "ssid":      ssid or "Unknown",
-                        "type":      "Beacon" if pkt.haslayer(Dot11Beacon) else "Probe",
-                        "signal":    getattr(pkt, 'dBm_AntSignal', 'N/A'),
-                        "detail":    (f"MAC {mac} | SSID '{ssid or 'Unknown'}' | "
-                                      f"Signal {getattr(pkt, 'dBm_AntSignal', 'N/A')}"),
-                    }
-                    try:
-                        self.detections.put_nowait(detection)
-                    except queue.Full:
-                        pass
-                    print(f"📡 DRONE DETECTED (RF)! "
-                          f"{mac} | {ssid} | "
-                          f"Signal: {detection['signal']}")
-        except Exception:
-            pass
-
-    def _channel_hopper(self):
-        channels = list(range(1, 14))
-        idx = 0
-        while self.running:
-            try:
-                subprocess.run(
-                    ["sudo", "iwconfig", self.monitor_iface,
-                     "channel", str(channels[idx])],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                idx = (idx + 1) % len(channels)
-                time.sleep(1.2)
-            except Exception:
-                time.sleep(2)
-
-    def _sniff_loop(self):
-        try:
-            sniff(iface=self.monitor_iface, prn=self._packet_handler,
-                  store=False, monitor=True)
-        except Exception as e:
-            if self.running:
-                print(f"Sniff error: {e}")
-
-    def start(self):
-        if not RF_AVAILABLE:
-            print("❌ RF detection unavailable (Scapy not installed).")
-            return False
-        if not self.setup_monitor_mode():
-            return False
-        self.running = True
-        if self.channel_hop:
-            threading.Thread(target=self._channel_hopper, daemon=True).start()
-        self._thread = threading.Thread(target=self._sniff_loop, daemon=True)
-        self._thread.start()
-        print(f"📡 RF drone detector running on {self.monitor_iface}...")
-        return True
-
-    def stop(self):
-        self.running = False
-        try:
-            subprocess.run(["sudo", "airmon-ng", "stop", self.monitor_iface],
-                           capture_output=True, stderr=subprocess.DEVNULL)
-            base = self.monitor_iface.replace("mon", "")
-            print(f"✅ Restored {base} to managed mode.")
-        except Exception:
-            pass
-
-    def print_stats(self):
-        s = self.stats
-        print(f"   📡 Beacons: {s['beacons']} | "
-              f"Probes: {s['probes']} | RF drones: {s['drones']}")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def find_camera_microphone():
+    """
+    Auto-detect a camera microphone, preferring built-in/internal audio over
+    USB dongles (like the TP-Link WiFi adapter). Returns device index or None
+    if no suitable camera mic found.
+    """
+    if not PYAUDIO_AVAILABLE:
+        return None
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    camera_candidates = []  # (index, name) of likely built-in mics
+    usb_candidates = []     # (index, name) of likely USB audio
+
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info["maxInputChannels"] == 0:
+            continue
+        name_lower = info["name"].lower()
+        # Prefer built-in / camera keywords
+        if any(kw in name_lower for kw in ["camera", "built-in", "builtin",
+                                             "internal", "headset", "headphone"]):
+            camera_candidates.append((i, info["name"]))
+        # Deprioritize USB
+        elif any(kw in name_lower for kw in ["usb", "adapter"]):
+            usb_candidates.append((i, info["name"]))
+
+    pa.terminate()
+
+    # Return the first camera candidate if found
+    if camera_candidates:
+        idx, name = camera_candidates[0]
+        print(f"✅ Auto-detected camera microphone: {name} (device {idx})")
+        return idx
+    # Otherwise return None (will use system default)
+    return None
+
 
 def list_audio_devices():
     """Print available PyAudio input devices and exit."""
@@ -502,18 +473,16 @@ def list_audio_devices():
 def main():
     global DRONE_FREQ_LOW, DRONE_FREQ_HIGH, PEAK_PROMINENCE
     global MIN_HARMONIC_PEAKS, CONFIRM_FRAMES
+    global HARMONIC_TOLERANCE, MIN_ENERGY_RATIO, ACOUSTIC_DEBUG
 
     parser = argparse.ArgumentParser(
-        description="Acoustic + RF Drone Detector (Jetson Nano)",
+        description="Acoustic Drone Detector (Jetson Nano)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   sudo python3 acoustic_drone_detector.py
   sudo python3 acoustic_drone_detector.py --list-audio
   sudo python3 acoustic_drone_detector.py --audio-device 1
-  sudo python3 acoustic_drone_detector.py --no-rf
-  sudo python3 acoustic_drone_detector.py --no-acoustic
-  sudo python3 acoustic_drone_detector.py --iface wlxb8fbb3c4e916mon
 
 Acoustic tuning flags (advanced):
   --freq-low / --freq-high   : drone band Hz  (default 80–2000)
@@ -522,17 +491,10 @@ Acoustic tuning flags (advanced):
   --confirm-frames           : consecutive positive frames to alert  (default 2)
         """
     )
-    parser.add_argument("--iface",           help="Monitor interface (RF)")
-    parser.add_argument("--no-hop",          action="store_true",
-                        help="Disable WiFi channel hopping (RF)")
-    parser.add_argument("--no-rf",           action="store_true",
-                        help="Disable RF detection entirely")
-    parser.add_argument("--no-acoustic",     action="store_true",
-                        help="Disable acoustic detection entirely")
     parser.add_argument("--list-audio",      action="store_true",
                         help="List microphone devices and exit")
     parser.add_argument("--audio-device",    type=int, default=None,
-                        help="PyAudio device index for microphone (default: system default)")
+                        help="PyAudio device index for microphone (default: auto-detect camera mic, or system default)")
     parser.add_argument("--freq-low",        type=int, default=DRONE_FREQ_LOW,
                         help=f"Low end of drone frequency band Hz (default {DRONE_FREQ_LOW})")
     parser.add_argument("--freq-high",       type=int, default=DRONE_FREQ_HIGH,
@@ -541,8 +503,17 @@ Acoustic tuning flags (advanced):
                         help=f"FFT peak prominence dB (default {PEAK_PROMINENCE})")
     parser.add_argument("--min-harmonics",   type=int, default=MIN_HARMONIC_PEAKS,
                         help=f"Min harmonic peaks to classify as drone (default {MIN_HARMONIC_PEAKS})")
+    parser.add_argument("--harmonic-tolerance", type=float,
+                        default=HARMONIC_TOLERANCE,
+                        help=f"Harmonic frequency tolerance fraction (default {HARMONIC_TOLERANCE})")
+    parser.add_argument("--energy-ratio",    type=float, default=MIN_ENERGY_RATIO,
+                        help=f"Minimum drone band energy ratio (default {MIN_ENERGY_RATIO})")
     parser.add_argument("--confirm-frames",  type=int, default=CONFIRM_FRAMES,
                         help=f"Consecutive positive frames before alert (default {CONFIRM_FRAMES})")
+    parser.add_argument("--debug-acoustic",  action="store_true",
+                        help="Print detailed acoustic FFT/peak diagnostics to help tune detection")
+    parser.add_argument("--spectrogram",    action="store_true",
+                        help="Print an ASCII spectrum visualization for each audio frame")
     args = parser.parse_args()
 
     if args.list_audio:
@@ -550,49 +521,30 @@ Acoustic tuning flags (advanced):
         sys.exit(0)
 
     # Apply tunable overrides
-    DRONE_FREQ_LOW    = args.freq_low
-    DRONE_FREQ_HIGH   = args.freq_high
-    PEAK_PROMINENCE   = args.prominence
-    MIN_HARMONIC_PEAKS = args.min_harmonics
-    CONFIRM_FRAMES    = args.confirm_frames
-
-    if args.no_rf and args.no_acoustic:
-        print("❌ Both --no-rf and --no-acoustic specified — nothing to do.")
-        sys.exit(1)
+    DRONE_FREQ_LOW      = args.freq_low
+    DRONE_FREQ_HIGH     = args.freq_high
+    PEAK_PROMINENCE     = args.prominence
+    MIN_HARMONIC_PEAKS  = args.min_harmonics
+    HARMONIC_TOLERANCE  = args.harmonic_tolerance
+    MIN_ENERGY_RATIO    = args.energy_ratio
+    CONFIRM_FRAMES      = args.confirm_frames
+    ACOUSTIC_DEBUG      = args.debug_acoustic
+    ACOUSTIC_SPECTROGRAM = args.spectrogram
 
     print("=" * 60)
-    print("  Acoustic + RF Drone Detector")
+    print("  Acoustic Drone Detector")
     print("=" * 60)
 
-    # Shared detection queue — both detectors write here
     shared_queue = queue.Queue(maxsize=100)
 
-    rf_detector       = None
-    acoustic_detector = None
+    acoustic_detector = AcousticDroneDetector(
+        device_index     = args.audio_device,
+        detections_queue = shared_queue,
+    )
+    acoustic_started = acoustic_detector.start()
 
-    if not args.no_rf:
-        rf_detector = RFDroneDetector(
-            monitor_iface   = args.iface,
-            channel_hop     = not args.no_hop,
-            detections_queue= shared_queue,
-        )
-        rf_started = rf_detector.start()
-    else:
-        print("ℹ️  RF detection disabled.")
-        rf_started = False
-
-    if not args.no_acoustic:
-        acoustic_detector = AcousticDroneDetector(
-            device_index     = args.audio_device,
-            detections_queue = shared_queue,
-        )
-        acoustic_started = acoustic_detector.start()
-    else:
-        print("ℹ️  Acoustic detection disabled.")
-        acoustic_started = False
-
-    if not rf_started and not acoustic_started:
-        print("❌ No detectors started. Exiting.")
+    if not acoustic_started:
+        print("❌ Acoustic detector failed to start. Exiting.")
         sys.exit(1)
 
     print("\n🚀 Detector running — press Ctrl+C to stop\n")
@@ -601,10 +553,7 @@ Acoustic tuning flags (advanced):
         while True:
             time.sleep(5)
             print(f"\n── Stats @ {datetime.now().strftime('%H:%M:%S')} ──")
-            if rf_detector and rf_started:
-                rf_detector.print_stats()
-            if acoustic_detector and acoustic_started:
-                acoustic_detector.print_stats()
+            acoustic_detector.print_stats()
 
             # Drain and display any new detections
             while not shared_queue.empty():
@@ -616,10 +565,7 @@ Acoustic tuning flags (advanced):
     except KeyboardInterrupt:
         print("\n⏹️  Stopping...")
     finally:
-        if rf_detector:
-            rf_detector.stop()
-        if acoustic_detector:
-            acoustic_detector.stop()
+        acoustic_detector.stop()
         print("✅ Done.")
 
 

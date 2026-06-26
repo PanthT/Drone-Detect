@@ -277,7 +277,7 @@ class JetsonDroneDetector:
             print(f"✓ Found trained drone model: {model_path}")
         else:
             # Fall back to base YOLO26 model
-            model_path = f'yolo11n_drone.pt'
+            model_path = f'best.pt'
             if not Path(model_path).exists():
                 print(f"❌ No trained model found and base model not found: {model_path}")
                 print("Options:")

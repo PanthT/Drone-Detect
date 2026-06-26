@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drone Detection Dashboard</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #0a0c10;
+    --bg2: #10131a;
+    --bg3: #161b25;
+    --border: rgba(255,255,255,0.08);
+    --border2: rgba(255,255,255,0.14);
+    --text: #e8eaf0;
+    --muted: #6b7280;
+    --accent: #3b82f6;
+    --green: #22c55e;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --cyan: #06b6d4;
+    --purple: #a855f7;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── Top bar ── */
+  .topbar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 24px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .topbar-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .logo-icon {
+    width: 28px; height: 28px;
+    background: var(--accent);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .topbar-time {
+    margin-left: auto;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .threat-badge {
+    padding: 4px 12px;
+    border-radius: 99px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    transition: background 0.3s, color 0.3s;
+  }
+  .threat-CLEAR    { background: rgba(34,197,94,0.15);  color: var(--green); }
+  .threat-LOW      { background: rgba(6,182,212,0.15);  color: var(--cyan); }
+  .threat-MEDIUM   { background: rgba(245,158,11,0.15); color: var(--amber); }
+  .threat-HIGH     { background: rgba(239,68,68,0.15);  color: var(--red); }
+  .threat-CRITICAL { background: var(--red);             color: #fff; animation: pulse 1s infinite; }
+
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.7} }
+
+  /* ── Layout ── */
+  .main { padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; }
+
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+
+  /* ── Cards ── */
+  .card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+  }
+  .card-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+  }
+  .card-header h3 { font-size: 13px; font-weight: 600; flex: 1; }
+  .card-body { padding: 14px 16px; }
+
+  /* ── Sensor status dot ── */
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    flex-shrink: 0;
+    transition: background 0.4s;
+  }
+  .dot-active   { background: var(--green); box-shadow: 0 0 6px var(--green); }
+  .dot-idle     { background: var(--muted); }
+  .dot-alert    { background: var(--red);   box-shadow: 0 0 8px var(--red); animation: pulse 0.8s infinite; }
+
+  /* ── Metric row ── */
+  .metrics { display: flex; gap: 0; }
+  .metric {
+    flex: 1;
+    padding: 10px 12px;
+    border-right: 1px solid var(--border);
+  }
+  .metric:last-child { border-right: none; }
+  .metric-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 4px; }
+  .metric-value { font-size: 22px; font-weight: 600; font-family: 'SF Mono', monospace; line-height: 1; }
+  .metric-sub { font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+  /* ── FFT spectrum bar ── */
+  .spectrum { display: flex; align-items: flex-end; gap: 2px; height: 60px; margin-top: 10px; }
+  .spec-bar {
+    flex: 1;
+    background: var(--accent);
+    border-radius: 2px 2px 0 0;
+    min-height: 2px;
+    transition: height 0.18s ease-out, background 0.3s;
+    opacity: 0.7;
+  }
+  .spec-bar.hot { background: var(--red); opacity: 1; }
+  .spectrum-label { display: flex; justify-content: space-between; font-size: 10px; color: var(--muted); margin-top: 4px; }
+
+  /* ── RF Network table ── */
+  .rf-table { width: 100%; border-collapse: collapse; }
+  .rf-table th {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--muted); padding: 6px 8px; text-align: left;
+    border-bottom: 1px solid var(--border);
+  }
+  .rf-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); font-size: 12px; }
+  .rf-table tr:last-child td { border-bottom: none; }
+  .rf-table tr { transition: background 0.2s; }
+  .rf-table tr:hover td { background: rgba(255,255,255,0.03); }
+  .pill {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 99px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  .pill-CLEAR    { background: rgba(107,114,128,0.2); color: var(--muted); }
+  .pill-LOW      { background: rgba(6,182,212,0.15);  color: var(--cyan); }
+  .pill-MEDIUM   { background: rgba(245,158,11,0.15); color: var(--amber); }
+  .pill-HIGH     { background: rgba(239,68,68,0.2);   color: var(--red); }
+  .pill-CRITICAL { background: var(--red); color: #fff; }
+
+  .signal-bar-wrap { display: flex; align-items: center; gap: 6px; }
+  .signal-bar { height: 4px; border-radius: 2px; background: var(--border2); flex: 1; overflow: hidden; }
+  .signal-fill { height: 100%; border-radius: 2px; background: var(--accent); transition: width 0.4s; }
+
+  /* ── Camera panel ── */
+  .camera-view {
+    background: #000;
+    border-radius: 6px;
+    aspect-ratio: 16/9;
+    position: relative;
+    overflow: hidden;
+    font-family: monospace;
+  }
+  .camera-canvas { width: 100%; height: 100%; display: block; }
+  .cam-overlay {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+  }
+  .cam-hud {
+    position: absolute; top: 8px; left: 8px;
+    font-size: 10px; color: #0f0; line-height: 1.7;
+    font-family: 'SF Mono', monospace;
+    text-shadow: 0 0 6px #0f0;
+  }
+  .cam-rec {
+    position: absolute; top: 8px; right: 8px;
+    display: flex; align-items: center; gap: 5px;
+    font-size: 10px; color: #fff;
+  }
+  .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); animation: pulse 1s infinite; }
+
+  /* ── Detection log ── */
+  .det-log {
+    height: 200px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column-reverse;
+    gap: 4px;
+  }
+  .det-log::-webkit-scrollbar { width: 4px; }
+  .det-log::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+  .log-entry {
+    display: flex;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 5px;
+    background: var(--bg3);
+    font-size: 11px;
+    align-items: flex-start;
+    animation: slideIn 0.3s ease-out;
+  }
+  @keyframes slideIn { from { opacity:0; transform: translateY(6px); } to { opacity:1; transform: none; } }
+  .log-time { color: var(--muted); flex-shrink: 0; font-family: monospace; }
+  .log-src {
+    flex-shrink: 0;
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.05em;
+  }
+  .src-ACOUSTIC { background: rgba(168,85,247,0.2); color: var(--purple); }
+  .src-RF       { background: rgba(6,182,212,0.2);  color: var(--cyan); }
+  .src-CAMERA   { background: rgba(34,197,94,0.2);  color: var(--green); }
+  .log-msg { flex: 1; color: var(--text); line-height: 1.4; }
+
+  /* ── Harmonic chart ── */
+  .harmonic-bars { display: flex; flex-direction: column; gap: 5px; margin-top: 8px; }
+  .h-row { display: flex; align-items: center; gap: 8px; }
+  .h-label { font-size: 10px; color: var(--muted); width: 50px; text-align: right; flex-shrink: 0; }
+  .h-bar-wrap { flex: 1; height: 12px; background: var(--bg3); border-radius: 3px; overflow: hidden; }
+  .h-bar { height: 100%; border-radius: 3px; transition: width 0.3s ease-out; }
+  .h-val { font-size: 10px; color: var(--muted); width: 32px; text-align: right; flex-shrink: 0; }
+
+  /* ── Confidence gauge ── */
+  .gauge-wrap { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .gauge-ring { position: relative; width: 80px; height: 80px; }
+  .gauge-ring svg { width: 80px; height: 80px; transform: rotate(-90deg); }
+  .gauge-ring .track { fill: none; stroke: var(--bg3); stroke-width: 8; }
+  .gauge-ring .arc   { fill: none; stroke-width: 8; stroke-linecap: round; transition: stroke-dashoffset 0.4s, stroke 0.4s; }
+  .gauge-val {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
+    font-size: 16px; font-weight: 700; font-family: monospace;
+    transition: color 0.4s;
+  }
+  .gauge-label { font-size: 10px; color: var(--muted); text-align: center; }
+
+  /* ── Tracker state ── */
+  .tracker-state {
+    display: flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    border-radius: 5px;
+    font-size: 11px; font-weight: 600;
+  }
+  .ts-IDLE     { background: rgba(107,114,128,0.15); color: var(--muted); }
+  .ts-TRACKING { background: rgba(34,197,94,0.15);   color: var(--green); }
+  .ts-COASTING { background: rgba(245,158,11,0.15);  color: var(--amber); }
+
+  /* ── Controls ── */
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .btn {
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border2);
+    background: transparent;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    font-family: var(--font);
+  }
+  .btn:hover  { background: rgba(255,255,255,0.06); border-color: var(--border2); }
+  .btn:active { transform: scale(0.97); }
+  .btn.active { background: rgba(59,130,246,0.2); border-color: var(--accent); color: var(--accent); }
+  .btn.danger { border-color: rgba(239,68,68,0.4); color: var(--red); }
+  .btn.danger:hover { background: rgba(239,68,68,0.1); }
+
+  .toggle-label { display: flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+  .toggle-switch {
+    width: 32px; height: 18px; border-radius: 99px;
+    background: var(--border2);
+    position: relative;
+    transition: background 0.2s;
+    flex-shrink: 0;
+  }
+  .toggle-switch.on { background: var(--green); }
+  .toggle-switch::after {
+    content: '';
+    position: absolute;
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    background: #fff;
+    top: 3px; left: 3px;
+    transition: transform 0.2s;
+  }
+  .toggle-switch.on::after { transform: translateX(14px); }
+
+  .sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
+
+  /* ── Footer ── */
+  .footer {
+    padding: 12px 24px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 16px;
+    font-size: 11px;
+    color: var(--muted);
+  }
+  .footer span b { color: var(--text); font-weight: 500; }
+</style>
+</head>
+<body>
+
+<!-- Top bar -->
+<div class="topbar">
+  <div class="topbar-logo">
+    <div class="logo-icon">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+        <circle cx="8" cy="8" r="3" fill="white"/>
+        <path d="M2 8h2M12 8h2M8 2v2M8 12v2" stroke="white" stroke-width="1.5" stroke-linecap="round"/>
+        <path d="M3.5 3.5l1.5 1.5M11 11l1.5 1.5M11 3.5l-1.5 1.5M5 11l-1.5 1.5" stroke="white" stroke-width="1.2" stroke-linecap="round"/>
+      </svg>
+    </div>
+    Drone Detection System
+  </div>
+
+  <div class="controls" style="margin-left: 24px;">
+    <label class="toggle-label" onclick="toggleSensor('acoustic')">
+      <div class="toggle-switch" id="tog-acoustic"></div>
+      <span style="color:var(--purple);">Acoustic</span>
+    </label>
+    <div class="sep"></div>
+    <label class="toggle-label" onclick="toggleSensor('rf')">
+      <div class="toggle-switch" id="tog-rf"></div>
+      <span style="color:var(--cyan);">RF</span>
+    </label>
+    <div class="sep"></div>
+    <label class="toggle-label" onclick="toggleSensor('camera')">
+      <div class="toggle-switch" id="tog-camera"></div>
+      <span style="color:var(--green);">Camera</span>
+    </label>
+  </div>
+
+  <div style="margin-left: auto; display: flex; align-items: center; gap: 12px;">
+    <div class="threat-badge threat-CLEAR" id="global-threat">CLEAR</div>
+    <button class="btn danger" onclick="promptLiveData()">Live Data Instructions</button>
+    <button class="btn" onclick="clearLog()">Clear Log</button>
+    <div class="topbar-time" id="clock">00:00:00</div>
+  </div>
+</div>
+
+<div class="main">
+
+  <!-- ── Row 1: Sensor overview cards ── -->
+  <div class="grid3">
+
+    <!-- Acoustic -->
+    <div class="card">
+      <div class="card-header">
+        <div class="status-dot dot-idle" id="dot-acoustic"></div>
+        <h3>Acoustic Detector</h3>
+        <span style="font-size:10px; color:var(--muted);">FFT · 44.1 kHz</span>
+      </div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-label">Frames</div>
+          <div class="metric-value" id="ac-frames">0</div>
+          <div class="metric-sub">analysed</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Positive</div>
+          <div class="metric-value" id="ac-positive" style="color:var(--amber);">0</div>
+          <div class="metric-sub">frames</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Alerts</div>
+          <div class="metric-value" id="ac-alerts" style="color:var(--red);">0</div>
+          <div class="metric-sub">fired</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div style="font-size:10px; color:var(--muted); margin-bottom:4px;">FFT Spectrum · 80–800 Hz drone band</div>
+        <div class="spectrum" id="spectrum"></div>
+        <div class="spectrum-label"><span>80 Hz</span><span>300 Hz</span><span>800 Hz</span></div>
+        <div style="margin-top: 12px;">
+          <div style="font-size:10px; color:var(--muted); margin-bottom:6px;">Harmonic series</div>
+          <div class="harmonic-bars" id="harmonics"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RF -->
+    <div class="card">
+      <div class="card-header">
+        <div class="status-dot dot-idle" id="dot-rf"></div>
+        <h3>RF Scanner</h3>
+        <span style="font-size:10px; color:var(--muted);">2.4 / 5 GHz</span>
+      </div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-label">Scans</div>
+          <div class="metric-value" id="rf-scans">0</div>
+          <div class="metric-sub">completed</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Networks</div>
+          <div class="metric-value" id="rf-nets">0</div>
+          <div class="metric-sub">visible</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Alerts</div>
+          <div class="metric-value" id="rf-alerts" style="color:var(--red);">0</div>
+          <div class="metric-sub">drone SSIDs</div>
+        </div>
+      </div>
+      <div class="card-body" style="padding:0;">
+        <table class="rf-table" id="rf-table">
+          <thead>
+            <tr>
+              <th>SSID</th>
+              <th>GHz</th>
+              <th>dBm</th>
+              <th>Signal</th>
+              <th>Threat</th>
+            </tr>
+          </thead>
+          <tbody id="rf-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Camera -->
+    <div class="card">
+      <div class="card-header">
+        <div class="status-dot dot-idle" id="dot-camera"></div>
+        <h3>Camera · YOLO v26</h3>
+        <span style="font-size:10px; color:var(--muted);">TensorRT FP16</span>
+      </div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-label">FPS</div>
+          <div class="metric-value" id="cam-fps" style="color:var(--green);">0</div>
+          <div class="metric-sub">frames/sec</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Inference</div>
+          <div class="metric-value" id="cam-inf">0</div>
+          <div class="metric-sub">ms</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Drones</div>
+          <div class="metric-value" id="cam-drones" style="color:var(--red);">0</div>
+          <div class="metric-sub">detected</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="camera-view">
+          <canvas class="camera-canvas" id="cam-canvas"></canvas>
+          <div class="cam-overlay">
+            <div class="cam-hud" id="cam-hud">
+              FPS: 0<br>
+              INF: 0ms<br>
+              TRACKER: IDLE
+            </div>
+            <div class="cam-rec">
+              <div class="rec-dot"></div> REC
+            </div>
+          </div>
+        </div>
+        <div style="display:flex; gap: 8px; margin-top: 10px; align-items: center; flex-wrap: wrap;">
+          <div class="tracker-state ts-IDLE" id="tracker-state">
+            <span id="tracker-state-txt">TRACKER: IDLE</span>
+          </div>
+          <div style="margin-left:auto; display:flex; gap: 10px;">
+            <div class="gauge-wrap">
+              <div class="gauge-ring">
+                <svg viewBox="0 0 80 80"><circle class="track" cx="40" cy="40" r="30"/><circle class="arc" id="gauge-arc" cx="40" cy="40" r="30" stroke-dasharray="188.5" stroke-dashoffset="188.5" stroke="var(--green)"/></svg>
+                <div class="gauge-val" id="gauge-val" style="color:var(--green);">0%</div>
+              </div>
+              <div class="gauge-label">Confidence</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── Row 2: Detection log ── -->
+  <div class="card">
+    <div class="card-header">
+      <div class="status-dot dot-active" id="dot-log"></div>
+      <h3>Detection Log</h3>
+      <span style="font-size:10px; color:var(--muted); margin-left: auto;" id="log-count">0 events</span>
+    </div>
+    <div class="card-body" style="padding: 8px 12px;">
+      <div class="det-log" id="det-log"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Footer -->
+<div class="footer">
+  <span>Platform: <b>NVIDIA Jetson Orin Nano</b></span>
+  <span>Interface: <b>wlxb8fbb3c4e916</b></span>
+  <span>Audio: <b>device 0 · 44.1 kHz</b></span>
+  <span>Model: <b>best.pt · YOLOv8n</b></span>
+  <span>Power: <b>MAXN 15W</b></span>
+  <span style="margin-left:auto;" id="uptime-display">Uptime: 0s</span>
+</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+const state = {
+  sensors: { acoustic: false, rf: false, camera: false },
+  acoustic: { frames: 0, positive: 0, alerts: 0, confirmCount: 0 },
+  rf: { scans: 0, nets: [], rfAlerts: 0 },
+  camera: { fps: 0, inference: 0, drones: 0, trackerState: 'IDLE', confidence: 0, coastCount: 0 },
+  log: [],
+  globalThreat: 'CLEAR',
+  startTime: Date.now(),
+  liveData: false,
+  alertMode: false,
+  alertTimer: 0,
+  cameraWebSocket: null,
+};
+
+// ── RF network pool ────────────────────────────────────────────────────────
+const rfPool = [
+  { ssid: 'DJI_Mavic3_8F2A', freq: 5.745, ch: 149, dbm: -52, enc: false,  threat: 'CRITICAL' },
+  { ssid: 'Phantom4_RC_Link', freq: 5.180, ch: 36,  dbm: -61, enc: false,  threat: 'HIGH' },
+  { ssid: 'MINI-3-Pro_7C1B', freq: 2.432, ch: 5,   dbm: -68, enc: false,  threat: 'HIGH' },
+  { ssid: 'Autel_Evo2_A4D1', freq: 5.200, ch: 40,  dbm: -74, enc: false,  threat: 'MEDIUM' },
+  { ssid: 'TELLOADAPTER',    freq: 2.412, ch: 1,   dbm: -78, enc: false,  threat: 'MEDIUM' },
+  { ssid: 'Xfinity_Home',    freq: 2.437, ch: 6,   dbm: -71, enc: true,   threat: 'CLEAR' },
+  { ssid: 'BELL_5G_EF92',    freq: 5.500, ch: 100, dbm: -66, enc: true,   threat: 'CLEAR' },
+  { ssid: 'AndroidAP_9A2C',  freq: 2.462, ch: 11,  dbm: -81, enc: true,   threat: 'CLEAR' },
+  { ssid: 'FPV_Racer_02',    freq: 5.745, ch: 149, dbm: -58, enc: false,  threat: 'HIGH' },
+  { ssid: '<hidden>',        freq: 5.260, ch: 52,  dbm: -83, enc: true,   threat: 'LOW' },
+];
+
+// ── Drone SSID patterns (for alert simulation) ─────────────────────────────
+const DRONE_SSIDS = rfPool.filter(n => n.threat !== 'CLEAR');
+const CLEAR_SSIDS = rfPool.filter(n => n.threat === 'CLEAR');
+
+// ── Harmonic frequencies ───────────────────────────────────────────────────
+const harmonicLabels = ['1F · 120Hz','2F · 240Hz','3F · 360Hz','4F · 480Hz','5F · 600Hz'];
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function rand(a, b) { return Math.random() * (b - a) + a; }
+function randInt(a, b) { return Math.floor(rand(a, b+1)); }
+function now() {
+  const d = new Date();
+  return [d.getHours(), d.getMinutes(), d.getSeconds()]
+    .map(v => String(v).padStart(2,'0')).join(':');
+}
+function pct(v, max) { return Math.min(100, Math.max(0, (v/max)*100)); }
+
+// ── Clock ──────────────────────────────────────────────────────────────────
+function tickClock() {
+  document.getElementById('clock').textContent = now();
+  const up = Math.floor((Date.now() - state.startTime) / 1000);
+  const h = Math.floor(up/3600), m = Math.floor((up%3600)/60), s = up%60;
+  document.getElementById('uptime-display').textContent =
+    `Uptime: ${h ? h+'h ' : ''}${m ? m+'m ' : ''}${s}s`;
+}
+
+// ── Log ───────────────────────────────────────────────────────────────────
+function addLog(source, msg, level) {
+  const entry = { time: now(), source, msg, level };
+  state.log.unshift(entry);
+  if (state.log.length > 200) state.log.pop();
+  renderLog();
+}
+
+function renderLog() {
+  const el = document.getElementById('det-log');
+  const html = state.log.slice(0,80).map(e => `
+    <div class="log-entry">
+      <span class="log-time">${e.time}</span>
+      <span class="log-src src-${e.source}">${e.source}</span>
+      <span class="log-msg">${e.msg}</span>
+    </div>`).join('');
+  el.innerHTML = html;
+  document.getElementById('log-count').textContent = `${state.log.length} events`;
+}
+
+// ── Global threat ──────────────────────────────────────────────────────────
+function setGlobalThreat(level) {
+  const el = document.getElementById('global-threat');
+  el.className = `threat-badge threat-${level}`;
+  el.textContent = level;
+  state.globalThreat = level;
+}
+
+function computeGlobalThreat() {
+  const threats = ['CLEAR','LOW','MEDIUM','HIGH','CRITICAL'];
+  let maxIdx = 0;
+  // RF
+  state.rf.nets.forEach(n => {
+    const idx = threats.indexOf(n.threat);
+    if (idx > maxIdx) maxIdx = idx;
+  });
+  // Acoustic
+  if (state.acoustic.confirmCount >= 4) maxIdx = Math.max(maxIdx, 3);
+  // Camera
+  if (state.camera.drones > 0) maxIdx = Math.max(maxIdx, 3);
+  setGlobalThreat(threats[maxIdx]);
+}
+
+// ── Toggle sensor ─────────────────────────────────────────────────────────
+function connectCameraWebSocket() {
+  if (state.cameraWebSocket) return;
+  
+  let retries = 0;
+  const maxRetries = 20;
+  
+  function attemptConnection() {
+    try {
+      state.cameraWebSocket = new WebSocket('ws://localhost:8765');
+      state.cameraWebSocket.binaryType = 'arraybuffer';
+      
+      state.cameraWebSocket.onopen = () => {
+        addLog('CAMERA', 'WebSocket connected to camera stream', 'INFO');
+      };
+      
+      state.cameraWebSocket.onmessage = (event) => {
+        if (event.data instanceof ArrayBuffer) {
+          const blob = new Blob([event.data], { type: 'image/jpeg' });
+          const url = URL.createObjectURL(blob);
+          const canvas = document.getElementById('cam-canvas');
+          const ctx = canvas.getContext('2d');
+          const img = new Image();
+          img.onload = () => {
+            // Set canvas pixel dimensions to match its display size
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+            URL.revokeObjectURL(url);
+          };
+          img.src = url;
+        }
+      };
+            
+      state.cameraWebSocket.onerror = (error) => {
+        state.cameraWebSocket = null;
+        if (retries < maxRetries && state.sensors.camera) {
+          retries++;
+          addLog('CAMERA', `WebSocket connection attempt ${retries}/${maxRetries}...`, 'INFO');
+          setTimeout(attemptConnection, 10000);
+        } else if (state.sensors.camera) {
+          addLog('CAMERA', 'WebSocket: Make sure --ws-port 8765 is passed to the detector and websockets is installed', 'ERROR');        }
+      };
+      
+      state.cameraWebSocket.onclose = () => {
+        state.cameraWebSocket = null;
+      };
+    } catch (err) {
+      state.cameraWebSocket = null;
+      if (retries < maxRetries && state.sensors.camera) {
+        retries++;
+        setTimeout(attemptConnection, 1000);
+      } else if (state.sensors.camera) {
+        addLog('CAMERA', `WebSocket failed: ${err.message}`, 'ERROR');
+      }
+    }
+  }
+  
+  attemptConnection();
+}
+
+function disconnectCameraWebSocket() {
+  if (state.cameraWebSocket) {
+    state.cameraWebSocket.close();
+    state.cameraWebSocket = null;
+    addLog('CAMERA', 'WebSocket disconnected from camera stream', 'INFO');
+  }
+}
+
+function toggleSensor(name) {
+  state.sensors[name] = !state.sensors[name];
+  const tog = document.getElementById(`tog-${name}`);
+  const dot = document.getElementById(`dot-${name}`);
+  
+  if (state.sensors[name]) {
+    tog.classList.add('on');
+    dot.className = 'status-dot dot-active';
+    addLog(name.toUpperCase(), `${name} detection enabled`, 'INFO');
+    
+    // Connect to camera WebSocket if camera
+    if (name === 'camera') {
+      setTimeout(() => connectCameraWebSocket(), 500);
+    }
+    
+    // Start the detector process via backend
+    fetch(`http://localhost:9000/start/${name}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) {
+          addLog(name.toUpperCase(), `${data.message}`, 'INFO');
+        } else {
+          addLog(name.toUpperCase(), `Error: ${data.message}`, 'ERROR');
+          tog.classList.remove('on');
+          dot.className = 'status-dot dot-idle';
+          state.sensors[name] = false;
+          if (name === 'camera') disconnectCameraWebSocket();
+        }
+      })
+      .catch(err => {
+        addLog(name.toUpperCase(), `Backend unavailable: Start dashboard_server.py on port 9000`, 'ERROR');
+        tog.classList.remove('on');
+        dot.className = 'status-dot dot-idle';
+        state.sensors[name] = false;
+        if (name === 'camera') disconnectCameraWebSocket();
+      });
+  } else {
+    tog.classList.remove('on');
+    dot.className = 'status-dot dot-idle';
+    addLog(name.toUpperCase(), `${name} detection disabled`, 'INFO');
+    
+    // Disconnect camera WebSocket if camera
+    if (name === 'camera') {
+      disconnectCameraWebSocket();
+    }
+    
+    // Stop the detector process via backend
+    fetch(`http://localhost:9000/stop/${name}`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.success) {
+          addLog(name.toUpperCase(), `${data.message}`, 'INFO');
+        }
+      })
+      .catch(err => {
+        // Silently fail on stop
+      });
+  }
+}
+
+// ── Simulate alert ────────────────────────────────────────────────────────
+function promptLiveData() {
+  addLog('SYSTEM', 'Dashboard backend server required. Run: python3 dashboard_server.py', 'INFO');
+  addLog('SYSTEM', 'Then use the toggle switches in the top bar to start/stop detectors.', 'INFO');
+  setGlobalThreat('CLEAR');
+  document.getElementById('dot-log').className = 'status-dot dot-active';
+}
+
+function clearLog() {
+  state.log = [];
+  renderLog();
+}
+
+// ── FFT Spectrum ──────────────────────────────────────────────────────────
+function initSpectrum() {
+  const el = document.getElementById('spectrum');
+  el.innerHTML = '';
+  for (let i = 0; i < 40; i++) {
+    const b = document.createElement('div');
+    b.className = 'spec-bar';
+    b.id = `sb-${i}`;
+    el.appendChild(b);
+  }
+}
+
+function updateSpectrum(dronePresent) {
+  for (let i = 0; i < 40; i++) {
+    const bar = document.getElementById(`sb-${i}`);
+    if (!bar) continue;
+    let h;
+    if (dronePresent && i >= 5 && i <= 35) {
+      // harmonic peaks at ~i=5,10,15,20,25 with noise
+      const harmonicPos = [5,10,15,20,25];
+      const near = harmonicPos.some(p => Math.abs(i - p) <= 1);
+      h = near ? rand(55, 95) : rand(5, 25);
+      bar.classList.toggle('hot', near && rand(0,1) > 0.3);
+    } else {
+      h = rand(3, 20);
+      bar.classList.remove('hot');
+    }
+    bar.style.height = h + '%';
+  }
+}
+
+// ── Harmonics ─────────────────────────────────────────────────────────────
+function initHarmonics() {
+  const el = document.getElementById('harmonics');
+  el.innerHTML = harmonicLabels.map((l, i) => `
+    <div class="h-row">
+      <div class="h-label">${l.split('·')[0].trim()}</div>
+      <div class="h-bar-wrap"><div class="h-bar" id="hb-${i}" style="width:0%;background:var(--purple)"></div></div>
+      <div class="h-val" id="hv-${i}">0 dB</div>
+    </div>`).join('');
+}
+
+function updateHarmonics(dronePresent) {
+  for (let i = 0; i < 5; i++) {
+    const bar = document.getElementById(`hb-${i}`);
+    const val = document.getElementById(`hv-${i}`);
+    if (!bar || !val) continue;
+    const v = dronePresent ? rand(45, 85) - i*8 : rand(2, 15);
+    bar.style.width = v + '%';
+    const db = dronePresent ? (rand(18, 36) - i*4).toFixed(1) : rand(0,6).toFixed(1);
+    val.textContent = db + ' dB';
+  }
+}
+
+// ── RF Table ──────────────────────────────────────────────────────────────
+function updateRFTable() {
+  const tbody = document.getElementById('rf-tbody');
+  tbody.innerHTML = state.rf.nets.map(n => {
+    const pct = Math.min(100, Math.max(5, ((n.dbm + 100) / 50) * 100));
+    const fillColor = n.threat === 'CLEAR' ? 'var(--muted)' :
+                      n.threat === 'LOW'   ? 'var(--cyan)'  :
+                      n.threat === 'MEDIUM'? 'var(--amber)' : 'var(--red)';
+    return `<tr>
+      <td style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${n.ssid}">${n.ssid}</td>
+      <td style="font-family:monospace;">${n.freq.toFixed(3)}</td>
+      <td style="font-family:monospace; color:${n.dbm >= -65 ? 'var(--amber)' : 'var(--muted)'};">${n.dbm}</td>
+      <td>
+        <div class="signal-bar-wrap">
+          <div class="signal-bar"><div class="signal-fill" style="width:${pct}%; background:${fillColor};"></div></div>
+        </div>
+      </td>
+      <td><span class="pill pill-${n.threat}">${n.threat}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Camera canvas ──────────────────────────────────────────────────────────
+let camFrame = 0;
+function drawCamera(dronePresent, bbox, conf) {
+  const canvas = document.getElementById('cam-canvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width = canvas.offsetWidth;
+  const H = canvas.height = canvas.offsetHeight;
+
+  ctx.fillStyle = '#050810';
+  ctx.fillRect(0,0,W,H);
+
+  // Subtle scanline effect
+  for (let y = 0; y < H; y += 4) {
+    ctx.fillStyle = 'rgba(0,255,0,0.012)';
+    ctx.fillRect(0, y, W, 1);
+  }
+
+  // Moving background "sky" particles
+  camFrame++;
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  for (let i = 0; i < 30; i++) {
+    const seed = i * 137.5;
+    const x = ((seed * 9.7 + camFrame * 0.3) % W);
+    const y = ((seed * 3.1 + camFrame * 0.15) % H);
+    const r = (Math.sin(seed + camFrame * 0.05) * 0.5 + 0.7);
+    ctx.beginPath();
+    ctx.arc(x, y, r, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // Crosshair reticle
+  const cx = W/2, cy = H/2;
+  ctx.strokeStyle = 'rgba(0,255,0,0.2)';
+  ctx.lineWidth = 0.5;
+  ctx.beginPath(); ctx.moveTo(cx - 20, cy); ctx.lineTo(cx + 20, cy); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, cy - 20); ctx.lineTo(cx, cy + 20); ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx, cy, 30, 0, Math.PI*2); ctx.stroke();
+
+  if (dronePresent && bbox) {
+    const [x1,y1,x2,y2] = bbox;
+    const bx = x1 * W, by = y1 * H, bw = (x2-x1)*W, bh = (y2-y1)*H;
+
+    // Detection box
+    ctx.strokeStyle = conf > 0.7 ? '#22c55e' : '#f59e0b';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, bw, bh);
+
+    // Corner brackets
+    const clen = 12;
+    ctx.lineWidth = 2;
+    [[bx,by],[bx+bw,by],[bx,by+bh],[bx+bw,by+bh]].forEach(([px,py], qi) => {
+      const sx = qi % 2 === 0 ? 1 : -1;
+      const sy = qi < 2 ? 1 : -1;
+      ctx.beginPath();
+      ctx.moveTo(px + sx*clen, py); ctx.lineTo(px, py); ctx.lineTo(px, py + sy*clen);
+      ctx.stroke();
+    });
+
+    // Label
+    ctx.fillStyle = conf > 0.7 ? 'rgba(34,197,94,0.85)' : 'rgba(245,158,11,0.85)';
+    ctx.fillRect(bx, by - 18, 120, 18);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 10px monospace';
+    ctx.fillText(`drone  ${(conf*100).toFixed(0)}%`, bx + 4, by - 5);
+
+    // Tracking lines (pulse from center to bbox center)
+    const tx = bx + bw/2, ty = by + bh/2;
+    ctx.strokeStyle = 'rgba(34,197,94,0.15)';
+    ctx.lineWidth = 0.5;
+    ctx.setLineDash([4,6]);
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(tx,ty); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Frame counter overlay
+  ctx.fillStyle = 'rgba(0,255,0,0.5)';
+  ctx.font = '9px monospace';
+  ctx.fillText(`FRAME #${String(camFrame).padStart(6,'0')}`, W - 100, H - 6);
+}
+
+// ── Confidence gauge ───────────────────────────────────────────────────────
+function updateGauge(conf) {
+  const arc = document.getElementById('gauge-arc');
+  const val = document.getElementById('gauge-val');
+  const circum = 188.5;
+  const offset = circum * (1 - conf/100);
+  arc.style.strokeDashoffset = offset;
+  const color = conf > 70 ? 'var(--red)' : conf > 40 ? 'var(--amber)' : 'var(--green)';
+  arc.style.stroke = color;
+  val.style.color = color;
+  val.textContent = Math.round(conf) + '%';
+}
+
+// ── Tracker state ──────────────────────────────────────────────────────────
+function setTrackerState(s, coast) {
+  const el = document.getElementById('tracker-state');
+  const txt = document.getElementById('tracker-state-txt');
+  el.className = `tracker-state ts-${s}`;
+  txt.textContent = s === 'COASTING' ? `TRACKER: COASTING (${coast}/10)` : `TRACKER: ${s}`;
+}
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+initSpectrum();
+initHarmonics();
+
+// Initial RF table is empty until real RF scanner data is available.
+state.rf.nets = [];
+updateRFTable();
+
+addLog('RF', 'Live RF feed requires dashboard backend. Run python3 dashboard_server.py, then toggle RF switch', 'INFO');
+addLog('ACOUSTIC', 'Live acoustic feed requires dashboard backend. Run python3 dashboard_server.py, then toggle Acoustic switch', 'INFO');
+addLog('CAMERA', 'Live camera feed requires dashboard backend. Run python3 dashboard_server.py, then toggle Camera switch', 'INFO');
+
+setInterval(tick, 500);
+setInterval(tickClock, 1000);
+</script>
+</body>
+</html>
