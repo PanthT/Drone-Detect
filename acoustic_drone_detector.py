@@ -129,6 +129,25 @@ HARMONIC_TOLERANCE = 0.15   # 15 %  (allows more real-world harmonic drift)
 # energy (filters out silence / very quiet background)
 MIN_ENERGY_RATIO  = 0.15    # (lowered to accept quieter drone tones)
 
+# ── Decibel-level thresholds specific to drone acoustic signatures ──────────
+# Drones produce a characteristic loudness range; these filters help reject
+# both quiet noise and non-drone loud sounds. Values are in dBFS (decibels
+# relative to full scale), which varies with mic gain — adjust for your setup.
+MIN_BAND_DB_LEVEL     = -45   # dBFS — minimum average level in drone band
+MAX_BAND_DB_LEVEL     = -5    # dBFS — maximum average level (clipping guard)
+
+# Harmonic dB rolloff ranges for drone verification. Real drone harmonics
+# decay at roughly 3–10 dB per step; inconsistent rolloff (e.g., a high
+# harmonic being louder than a lower one) may indicate non-drone RFI or
+# mechanical noise rather than a genuine multi-rotor harmonic series.
+MIN_HARMONIC_DB_ROLLOFF = 2.0   # dB minimum drop per harmonic step
+MAX_HARMONIC_DB_ROLLOFF = 14.0  # dB maximum drop per harmonic step
+
+# Minimum dB prominence of the strongest harmonic peak above the noise floor.
+# A genuine drone will have at least one strong tonal peak standing clearly
+# above the background — this filters out diffuse broadband noise.
+MIN_PEAK_DB_ABOVE_NOISE = 8.0   # dB
+
 # Acoustic debug prints extra FFT/peak information to help tune detection
 ACOUSTIC_DEBUG        = False
 ACOUSTIC_SPECTROGRAM  = False
@@ -299,10 +318,41 @@ class AcousticDroneDetector:
             self._confirm_count = 0
             return
 
-        # ── Peak finding in drone band ───────────────────────────────────────
+        # ── Decibel-level checks ────────────────────────────────────────────
+        # Drones produce sound within a characteristic loudness range. If the
+        # average dB level in the drone band is too quiet (likely just noise)
+        # or too loud (likely clipping or a non-drone source), reject the frame.
         band_db    = db[band_mask]
         band_freqs = freqs[band_mask]
+        avg_band_db = np.mean(band_db)
 
+        if avg_band_db < MIN_BAND_DB_LEVEL:
+            if ACOUSTIC_DEBUG:
+                print(f"[debug] avg_band_db={avg_band_db:.1f} dBFS below MIN_BAND_DB_LEVEL={MIN_BAND_DB_LEVEL} dBFS")
+            self._confirm_count = 0
+            return
+
+        if avg_band_db > MAX_BAND_DB_LEVEL:
+            if ACOUSTIC_DEBUG:
+                print(f"[debug] avg_band_db={avg_band_db:.1f} dBFS above MAX_BAND_DB_LEVEL={MAX_BAND_DB_LEVEL} dBFS — possible clipping")
+            self._confirm_count = 0
+            return
+
+        # Check that the strongest peak in the drone band stands clearly above
+        # the noise floor. A genuine drone produces at least one strong tonal
+        # peak; diffuse broadband noise won't pass this check.
+        noise_floor_db = np.percentile(band_db, 10)  # 10th percentile as noise floor estimate
+        peak_db_max = np.max(band_db)
+        peak_db_above_noise = peak_db_max - noise_floor_db
+
+        if peak_db_above_noise < MIN_PEAK_DB_ABOVE_NOISE:
+            if ACOUSTIC_DEBUG:
+                print(f"[debug] peak_db_above_noise={peak_db_above_noise:.1f} dB below MIN_PEAK_DB_ABOVE_NOISE={MIN_PEAK_DB_ABOVE_NOISE} dB")
+            self._confirm_count = 0
+            return
+
+        # ── Peak finding in drone band ───────────────────────────────────────
+        # (band_db and band_freqs are already assigned from the dB-level checks above)
         # find_peaks works on the band-limited spectrum. We look for
         # prominent narrowband peaks (tonal components) that could be the
         # propeller fundamental and its harmonics.
@@ -335,28 +385,50 @@ class AcousticDroneDetector:
         # drone produces a harmonic series; random noises typically do not.
         best_count    = 0
         best_fund     = 0.0
+        best_db_rolloffs = []  # dB rolloff values for the best candidate's harmonics
 
         for candidate_fund in peak_freqs:
             if candidate_fund < DRONE_FREQ_LOW:
                 continue
             count = 1   # the fundamental itself counts
+            harmonic_dbs = []  # store dB levels of each matched harmonic
             for harmonic_n in range(2, 10):
                 expected = candidate_fund * harmonic_n
                 if expected > DRONE_FREQ_HIGH:
                     break
                 # Is there a peak within tolerance of this harmonic?
                 tolerance_hz = expected * HARMONIC_TOLERANCE
-                close = np.any(np.abs(peak_freqs - expected) <= tolerance_hz)
-                if close:
+                close_mask = np.abs(peak_freqs - expected) <= tolerance_hz
+                if np.any(close_mask):
                     count += 1
+                    # Find the closest peak and record its dB level
+                    close_idx = np.argmin(np.abs(peak_freqs - expected))
+                    peak_db_val = band_db[peaks_idx[close_idx]]
+                    harmonic_dbs.append(peak_db_val)
+
             if count > best_count:
                 best_count = count
                 best_fund  = candidate_fund
+                best_db_rolloffs = harmonic_dbs
+
+        # ── Decibel rolloff check for the best candidate ────────────────────
+        # Real drone harmonics decay gradually at roughly 2–14 dB per step.
+        # If the rolloff between consecutive matched harmonics is outside this
+        # range, the signal is less likely to be a genuine multi-rotor drone.
+        db_rolloff_valid = True
+        if len(best_db_rolloffs) >= 2:
+            for i in range(len(best_db_rolloffs) - 1):
+                step_db = best_db_rolloffs[i] - best_db_rolloffs[i + 1]
+                if step_db < MIN_HARMONIC_DB_ROLLOFF or step_db > MAX_HARMONIC_DB_ROLLOFF:
+                    db_rolloff_valid = False
+                    if ACOUSTIC_DEBUG:
+                        print(f"[debug] harmonic dB rolloff {step_db:.1f} dB outside "
+                              f"[{MIN_HARMONIC_DB_ROLLOFF}, {MAX_HARMONIC_DB_ROLLOFF}] range")
 
         # Decide whether we have enough harmonics to consider this a drone.
         # `MIN_HARMONIC_PEAKS` is the tunable threshold for how many harmonics
         # must be present (including the fundamental).
-        is_drone = best_count >= MIN_HARMONIC_PEAKS
+        is_drone = best_count >= MIN_HARMONIC_PEAKS and db_rolloff_valid
 
         if is_drone:
             self.stats["positive_frames"] += 1
@@ -371,15 +443,20 @@ class AcousticDroneDetector:
             self._confirm_count = 0   # reset so we don't spam
             self.stats["alerts"] += 1
 
+            # Compute the dB level of the strongest peak for the alert message
+            peak_db_level = np.max(band_db[peaks_idx]) if len(peaks_idx) > 0 else -100
+
             detection = {
                 "source":      "ACOUSTIC",
                 "timestamp":   datetime.now().strftime("%H:%M:%S"),
                 "fundamental": f"{best_fund:.1f} Hz",
                 "harmonics":   best_count,
                 "energy_pct":  f"{energy_ratio * 100:.1f}%",
+                "peak_db":     f"{peak_db_level:.1f} dBFS",
                 "detail":      (f"Harmonic series at {best_fund:.0f} Hz "
                                 f"({best_count} harmonics, "
-                                f"band energy {energy_ratio*100:.1f}%)"),
+                                f"band energy {energy_ratio*100:.1f}%, "
+                                f"peak {peak_db_level:.1f} dBFS)"),
             }
 
             key = f"acoustic_{int(best_fund)}"
@@ -474,6 +551,9 @@ def main():
     global DRONE_FREQ_LOW, DRONE_FREQ_HIGH, PEAK_PROMINENCE
     global MIN_HARMONIC_PEAKS, CONFIRM_FRAMES
     global HARMONIC_TOLERANCE, MIN_ENERGY_RATIO, ACOUSTIC_DEBUG
+    global MIN_BAND_DB_LEVEL, MAX_BAND_DB_LEVEL
+    global MIN_HARMONIC_DB_ROLLOFF, MAX_HARMONIC_DB_ROLLOFF
+    global MIN_PEAK_DB_ABOVE_NOISE
 
     parser = argparse.ArgumentParser(
         description="Acoustic Drone Detector (Jetson Nano)",
@@ -514,6 +594,16 @@ Acoustic tuning flags (advanced):
                         help="Print detailed acoustic FFT/peak diagnostics to help tune detection")
     parser.add_argument("--spectrogram",    action="store_true",
                         help="Print an ASCII spectrum visualization for each audio frame")
+    parser.add_argument("--min-band-db",    type=float, default=MIN_BAND_DB_LEVEL,
+                        help=f"Minimum average dBFS level in drone band (default {MIN_BAND_DB_LEVEL})")
+    parser.add_argument("--max-band-db",    type=float, default=MAX_BAND_DB_LEVEL,
+                        help=f"Maximum average dBFS level in drone band (default {MAX_BAND_DB_LEVEL})")
+    parser.add_argument("--min-db-rolloff", type=float, default=MIN_HARMONIC_DB_ROLLOFF,
+                        help=f"Minimum dB rolloff between consecutive harmonics (default {MIN_HARMONIC_DB_ROLLOFF})")
+    parser.add_argument("--max-db-rolloff", type=float, default=MAX_HARMONIC_DB_ROLLOFF,
+                        help=f"Maximum dB rolloff between consecutive harmonics (default {MAX_HARMONIC_DB_ROLLOFF})")
+    parser.add_argument("--min-peak-db-above-noise", type=float, default=MIN_PEAK_DB_ABOVE_NOISE,
+                        help=f"Minimum dB of strongest peak above noise floor (default {MIN_PEAK_DB_ABOVE_NOISE})")
     args = parser.parse_args()
 
     if args.list_audio:
@@ -530,6 +620,11 @@ Acoustic tuning flags (advanced):
     CONFIRM_FRAMES      = args.confirm_frames
     ACOUSTIC_DEBUG      = args.debug_acoustic
     ACOUSTIC_SPECTROGRAM = args.spectrogram
+    MIN_BAND_DB_LEVEL   = args.min_band_db
+    MAX_BAND_DB_LEVEL   = args.max_band_db
+    MIN_HARMONIC_DB_ROLLOFF = args.min_db_rolloff
+    MAX_HARMONIC_DB_ROLLOFF = args.max_db_rolloff
+    MIN_PEAK_DB_ABOVE_NOISE = args.min_peak_db_above_noise
 
     print("=" * 60)
     print("  Acoustic Drone Detector")

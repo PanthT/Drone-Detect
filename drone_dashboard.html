@@ -178,7 +178,7 @@
     overflow: hidden;
     font-family: monospace;
   }
-  .camera-canvas { width: 100%; height: 100%; display: block; }
+  .camera-canvas { width: 100%; height: 100%; display: block; position: relative; z-index: 1; }
   .cam-overlay {
     position: absolute; top: 0; left: 0; right: 0; bottom: 0;
     pointer-events: none;
@@ -386,9 +386,9 @@
         </div>
       </div>
       <div class="card-body">
-        <div style="font-size:10px; color:var(--muted); margin-bottom:4px;">FFT Spectrum · 80–800 Hz drone band</div>
+        <div style="font-size:10px; color:var(--muted); margin-bottom:4px;">FFT Spectrum · Decibel levels</div>
         <div class="spectrum" id="spectrum"></div>
-        <div class="spectrum-label"><span>80 Hz</span><span>300 Hz</span><span>800 Hz</span></div>
+        <div class="spectrum-label"><span>-60 dB</span><span>-30 dB</span><span>0 dB</span></div>
         <div style="margin-top: 12px;">
           <div style="font-size:10px; color:var(--muted); margin-bottom:6px;">Harmonic series</div>
           <div class="harmonic-bars" id="harmonics"></div>
@@ -462,6 +462,7 @@
       </div>
       <div class="card-body">
         <div class="camera-view">
+          <img class="camera-stream" id="cam-stream" style="display:none; width:100%; height:100%; object-fit:contain; position:absolute; top:0; left:0;" />
           <canvas class="camera-canvas" id="cam-canvas"></canvas>
           <div class="cam-overlay">
             <div class="cam-hud" id="cam-hud">
@@ -530,7 +531,7 @@ const state = {
   liveData: false,
   alertMode: false,
   alertTimer: 0,
-  cameraWebSocket: null,
+  cameraStreamActive: false,
 };
 
 // ── RF network pool ────────────────────────────────────────────────────────
@@ -552,7 +553,7 @@ const DRONE_SSIDS = rfPool.filter(n => n.threat !== 'CLEAR');
 const CLEAR_SSIDS = rfPool.filter(n => n.threat === 'CLEAR');
 
 // ── Harmonic frequencies ───────────────────────────────────────────────────
-const harmonicLabels = ['1F · 120Hz','2F · 240Hz','3F · 360Hz','4F · 480Hz','5F · 600Hz'];
+const harmonicLabels = ['1F · -12 dB','2F · -18 dB','3F · -24 dB','4F · -30 dB','5F · -36 dB'];
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function rand(a, b) { return Math.random() * (b - a) + a; }
@@ -617,72 +618,25 @@ function computeGlobalThreat() {
 }
 
 // ── Toggle sensor ─────────────────────────────────────────────────────────
-function connectCameraWebSocket() {
-  if (state.cameraWebSocket) return;
+function connectCameraStream() {
+  if (state.cameraStreamActive) return;
   
-  let retries = 0;
-  const maxRetries = 20;
-  
-  function attemptConnection() {
-    try {
-      state.cameraWebSocket = new WebSocket('ws://localhost:8765');
-      state.cameraWebSocket.binaryType = 'arraybuffer';
-      
-      state.cameraWebSocket.onopen = () => {
-        addLog('CAMERA', 'WebSocket connected to camera stream', 'INFO');
-      };
-      
-      state.cameraWebSocket.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          const blob = new Blob([event.data], { type: 'image/jpeg' });
-          const url = URL.createObjectURL(blob);
-          const canvas = document.getElementById('cam-canvas');
-          const ctx = canvas.getContext('2d');
-          const img = new Image();
-          img.onload = () => {
-            // Set canvas pixel dimensions to match its display size
-            canvas.width = canvas.offsetWidth;
-            canvas.height = canvas.offsetHeight;
-            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            URL.revokeObjectURL(url);
-          };
-          img.src = url;
-        }
-      };
-            
-      state.cameraWebSocket.onerror = (error) => {
-        state.cameraWebSocket = null;
-        if (retries < maxRetries && state.sensors.camera) {
-          retries++;
-          addLog('CAMERA', `WebSocket connection attempt ${retries}/${maxRetries}...`, 'INFO');
-          setTimeout(attemptConnection, 10000);
-        } else if (state.sensors.camera) {
-          addLog('CAMERA', 'WebSocket: Make sure --ws-port 8765 is passed to the detector and websockets is installed', 'ERROR');        }
-      };
-      
-      state.cameraWebSocket.onclose = () => {
-        state.cameraWebSocket = null;
-      };
-    } catch (err) {
-      state.cameraWebSocket = null;
-      if (retries < maxRetries && state.sensors.camera) {
-        retries++;
-        setTimeout(attemptConnection, 1000);
-      } else if (state.sensors.camera) {
-        addLog('CAMERA', `WebSocket failed: ${err.message}`, 'ERROR');
-      }
-    }
-  }
-  
-  attemptConnection();
+  const img = document.getElementById('cam-stream');
+  img.style.display = 'block';
+  // Append a timestamp to force the browser to re-load the stream
+  img.src = 'http://localhost:9000/camera/stream?_=' + Date.now();
+  state.cameraStreamActive = true;
+  addLog('CAMERA', 'MJPEG camera stream connected via dashboard_server.py', 'INFO');
 }
 
-function disconnectCameraWebSocket() {
-  if (state.cameraWebSocket) {
-    state.cameraWebSocket.close();
-    state.cameraWebSocket = null;
-    addLog('CAMERA', 'WebSocket disconnected from camera stream', 'INFO');
-  }
+function disconnectCameraStream() {
+  if (!state.cameraStreamActive) return;
+  
+  const img = document.getElementById('cam-stream');
+  img.style.display = 'none';
+  img.src = '';
+  state.cameraStreamActive = false;
+  addLog('CAMERA', 'Camera stream disconnected', 'INFO');
 }
 
 function toggleSensor(name) {
@@ -695,9 +649,9 @@ function toggleSensor(name) {
     dot.className = 'status-dot dot-active';
     addLog(name.toUpperCase(), `${name} detection enabled`, 'INFO');
     
-    // Connect to camera WebSocket if camera
+    // Connect to camera MJPEG stream if camera
     if (name === 'camera') {
-      setTimeout(() => connectCameraWebSocket(), 500);
+      setTimeout(() => connectCameraStream(), 500);
     }
     
     // Start the detector process via backend
@@ -711,7 +665,7 @@ function toggleSensor(name) {
           tog.classList.remove('on');
           dot.className = 'status-dot dot-idle';
           state.sensors[name] = false;
-          if (name === 'camera') disconnectCameraWebSocket();
+          if (name === 'camera') disconnectCameraStream();
         }
       })
       .catch(err => {
@@ -719,16 +673,16 @@ function toggleSensor(name) {
         tog.classList.remove('on');
         dot.className = 'status-dot dot-idle';
         state.sensors[name] = false;
-        if (name === 'camera') disconnectCameraWebSocket();
+        if (name === 'camera') disconnectCameraStream();
       });
   } else {
     tog.classList.remove('on');
     dot.className = 'status-dot dot-idle';
     addLog(name.toUpperCase(), `${name} detection disabled`, 'INFO');
     
-    // Disconnect camera WebSocket if camera
+    // Disconnect camera stream if camera
     if (name === 'camera') {
-      disconnectCameraWebSocket();
+      disconnectCameraStream();
     }
     
     // Stop the detector process via backend
@@ -842,27 +796,33 @@ function drawCamera(dronePresent, bbox, conf) {
   const W = canvas.width = canvas.offsetWidth;
   const H = canvas.height = canvas.offsetHeight;
 
-  ctx.fillStyle = '#050810';
-  ctx.fillRect(0,0,W,H);
+  // Clear canvas (transparent so the MJPEG <img> behind shows through when streaming)
+  ctx.clearRect(0, 0, W, H);
 
-  // Subtle scanline effect
-  for (let y = 0; y < H; y += 4) {
-    ctx.fillStyle = 'rgba(0,255,0,0.012)';
-    ctx.fillRect(0, y, W, 1);
-  }
+  // When no MJPEG stream is active, fill with dark background
+  if (!state.cameraStreamActive) {
+    ctx.fillStyle = '#050810';
+    ctx.fillRect(0, 0, W, H);
 
-  // Moving background "sky" particles
-  camFrame++;
-  ctx.fillStyle = 'rgba(255,255,255,0.25)';
-  for (let i = 0; i < 30; i++) {
-    const seed = i * 137.5;
-    const x = ((seed * 9.7 + camFrame * 0.3) % W);
-    const y = ((seed * 3.1 + camFrame * 0.15) % H);
-    const r = (Math.sin(seed + camFrame * 0.05) * 0.5 + 0.7);
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI*2);
-    ctx.fill();
-  }
+    // Subtle scanline effect
+    for (let y = 0; y < H; y += 4) {
+      ctx.fillStyle = 'rgba(0,255,0,0.012)';
+      ctx.fillRect(0, y, W, 1);
+    }
+
+    // Moving background "sky" particles
+    camFrame++;
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    for (let i = 0; i < 30; i++) {
+      const seed = i * 137.5;
+      const x = ((seed * 9.7 + camFrame * 0.3) % W);
+      const y = ((seed * 3.1 + camFrame * 0.15) % H);
+      const r = (Math.sin(seed + camFrame * 0.05) * 0.5 + 0.7);
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }  // ← end if (!state.cameraStreamActive)
 
   // Crosshair reticle
   const cx = W/2, cy = H/2;
@@ -945,7 +905,7 @@ updateRFTable();
 
 addLog('RF', 'Live RF feed requires dashboard backend. Run python3 dashboard_server.py, then toggle RF switch', 'INFO');
 addLog('ACOUSTIC', 'Live acoustic feed requires dashboard backend. Run python3 dashboard_server.py, then toggle Acoustic switch', 'INFO');
-addLog('CAMERA', 'Live camera feed requires dashboard backend. Run python3 dashboard_server.py, then toggle Camera switch', 'INFO');
+addLog('CAMERA', 'Camera stream via MJPEG over dashboard_server.py:9000/camera/stream', 'INFO');
 
 setInterval(tick, 500);
 setInterval(tickClock, 1000);

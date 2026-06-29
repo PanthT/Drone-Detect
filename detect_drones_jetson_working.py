@@ -739,6 +739,23 @@ class JetsonDroneDetector:
         print(f"✓ Stream: {width}x{height} @ {fps}fps")
         print(f"\n🎮 Controls: 'q'=Quit, 's'=Snapshot, 'r'=Record, 't'=Thermal info")
         print("▶️  Starting detection...\n")
+
+        # ── Write a "starting up" placeholder frame so the dashboard's MJPEG
+        # stream gets *something* immediately instead of waiting 10-40+ seconds
+        # for the model to load and the first real detection frame to appear. ──
+        try:
+            placeholder = np.zeros((height, width, 3), dtype=np.uint8)
+            cv2.putText(placeholder, "Starting detection...",
+                        (width // 2 - 140, height // 2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            cv2.putText(placeholder, "(initializing camera & model)",
+                        (width // 2 - 120, height // 2 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
+            _startup_tmp = '/tmp/drone_detect_frame_tmp.jpg'
+            cv2.imwrite(_startup_tmp, placeholder)
+            os.rename(_startup_tmp, '/tmp/drone_detect_frame.jpg')
+        except Exception as e:
+            print(f"⚠️  Could not write startup placeholder frame: {e}")
         
         # Setup video writer
         writer = None
@@ -791,6 +808,19 @@ class JetsonDroneDetector:
                 # Add overlay
                 self._add_overlay(annotated_frame, current_fps, inference_time, 
                                 num_detections, recording)
+                
+                # Save latest annotated frame so dashboard_server.py can serve it
+                # via MJPEG over HTTP (written atomically via temp file + rename)
+                _frame_path = '/tmp/drone_detect_frame.jpg'
+                _frame_tmp   = '/tmp/drone_detect_frame_tmp.jpg'
+                try:
+                    ok = cv2.imwrite(_frame_tmp, annotated_frame)
+                    if not ok:
+                        print(f"⚠️  cv2.imwrite returned False for {_frame_tmp}")
+                    else:
+                        os.rename(_frame_tmp, _frame_path)
+                except Exception as e:
+                    print(f"⚠️  Could not save frame: {e}")
                 
                 # Record
                 if recording and writer:

@@ -10,8 +10,9 @@ import json
 import subprocess
 import signal
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+import time
 
 # Process tracking
 processes = {
@@ -22,12 +23,17 @@ processes = {
 
 class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        """Handle GET requests for status and control."""
+        """Handle GET requests for status, control, and camera MJPEG stream."""
         parsed = urlparse(self.path)
         path = parsed.path
+        
+        # ── MJPEG camera stream (long-lived connection, different headers) ──
+        if path == '/camera/stream':
+            return self._handle_camera_stream()
+        
         query = parse_qs(parsed.query)
         
-        # CORS headers
+        # CORS headers for JSON endpoints
         self.send_response(200)
         self.send_header('Content-type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -114,17 +120,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == '/start/camera':
             if processes['camera'] is None:
                 try:
-                    # In /start/camera block (around line 117-122)
+                    _camera_log = open('/tmp/drone_camera_detector.log', 'w')
+                    _camera_log.write('=== Camera detector started ===\n')
+                    _camera_log.flush()
                     processes['camera'] = subprocess.Popen(
                         ['python3', 'detect_drones_jetson_working.py', 
                         '--source', '0', 
-                        '--tensorrt', 
-                        '--fp16',
-                        '--ws-port', '8765'],   # ← ADD THIS
+                        '--no-display'],
                         stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
                         preexec_fn=os.setsid
                     )
+                    # Start a thread to log subprocess output in real-time
+                    def _log_camera_output(proc, logfile):
+                        for line in iter(proc.stdout.readline, b''):
+                            logfile.write(line.decode(errors='replace'))
+                            logfile.flush()
+                        logfile.close()
+                    import threading
+                    t = threading.Thread(
+                        target=_log_camera_output,
+                        args=(processes['camera'], _camera_log),
+                        daemon=True
+                    )
+                    t.start()
                     response['success'] = True
                     response['message'] = 'Camera detector started'
                 except Exception as e:
@@ -153,6 +172,79 @@ class DashboardHandler(BaseHTTPRequestHandler):
         
         self.wfile.write(json.dumps(response).encode())
     
+    def _handle_camera_stream(self):
+        """Serve the latest detection frame as an MJPEG stream.
+
+        Reads the JPEG file written by detect_drones_jetson_working.py and pushes
+        it to the browser repeatedly, keeping the connection open with the
+        'multipart/x-mixed-replace' content type.
+        """
+        import time
+        import logging
+        frame_path = Path('/tmp/drone_detect_frame.jpg')
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+        self.send_header('Pragma', 'no-cache')
+        self.send_header('Expires', '0')
+        self.send_header('Connection', 'keep-alive')
+        self.end_headers()
+
+        last_mtime = 0
+        sent_first = False
+        stall_count = 0
+        logging.info('MJPEG stream client connected')
+        try:
+            
+            while True:
+                if processes['camera'] is not None and processes['camera'].poll() is not None:
+                    logging.error('Camera detector process has exited (code=%s). Stream ending.',processes['camera'].poll())
+                    break
+                if frame_path.exists():
+                    mtime = frame_path.stat().st_mtime
+                    if mtime > last_mtime:
+                        last_mtime = mtime
+                        data = frame_path.read_bytes()
+                        if len(data) > 100:  # Sanity check: valid JPEG
+                            self.wfile.write(b'--FRAME\r\n')
+                            self.wfile.write(b'Content-Type: image/jpeg\r\n')
+                            self.wfile.write(f'Content-Length: {len(data)}\r\n'.encode())
+                            self.wfile.write(b'\r\n')
+                            self.wfile.write(data)
+                            self.wfile.write(b'\r\n')
+                            self.wfile.flush()
+                            if not sent_first:
+                                sent_first = True
+                                logging.info('MJPEG stream: first frame sent')
+                            stall_count = 0
+                        else:
+                            stall_count += 1
+                    else:
+                        stall_count += 1
+                else:
+                    if not sent_first:
+                        stall_count += 1
+                        if stall_count % 30 == 0:  # Log every ~1 second
+                            logging.info(
+                                'MJPEG stream waiting for frame at %s ... '
+                                '(start the camera detector from the dashboard)',
+                                frame_path
+                            )
+                time.sleep(0.033)  # ~30 fps
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logging.info('MJPEG stream client disconnected: %s', e)
+
+    def _monitor_processes():
+        while True:
+            for name in list(processes.keys()):
+                proc = processes[name]
+                if proc is not None and proc.poll() is not None:
+                    logging.warning('%s detector process exited (rc=%s)', name, proc.poll())
+                    processes[name] = None
+            time.sleep(2)
+
     def do_OPTIONS(self):
         """Handle CORS preflight."""
         self.send_response(200)
@@ -166,14 +258,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         pass
 
 if __name__ == '__main__':
+    import logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%H:%M:%S'
+    )
     port = 9000
-    server = HTTPServer(('localhost', port), DashboardHandler)
+    try:
+        server = ThreadingHTTPServer(('localhost', port), DashboardHandler)
+    except NameError:
+        # Fallback for Python < 3.7
+        from http.server import HTTPServer
+        server = HTTPServer(('localhost', port), DashboardHandler)
     print(f'Dashboard backend server running on http://localhost:{port}')
     print('Available endpoints:')
     print('  GET /status')
     print('  GET /start/acoustic | /stop/acoustic')
     print('  GET /start/rf | /stop/rf')
     print('  GET /start/camera | /stop/camera')
+    print('  GET /camera/stream')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
