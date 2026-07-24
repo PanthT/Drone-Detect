@@ -13,6 +13,40 @@ from pathlib import Path
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import time
+import threading
+from datetime import datetime
+
+# Import the get_audio_devices helper from the acoustic detector module
+try:
+    from acoustic_drone_detector import get_audio_devices
+except ImportError:
+    def get_audio_devices():
+        return []
+
+# SSE clients: list of dicts { 'wfile': wfile, 'lock': threading.Lock() }
+sse_clients: list[dict] = []
+sse_lock = threading.Lock()
+
+
+def broadcast_event(obj: dict):
+    """Send a JSON event to all connected EventSource clients."""
+    s = json.dumps(obj)
+    dead = []
+    with sse_lock:
+        for entry in list(sse_clients):
+            w = entry.get('wfile')
+            l = entry.get('lock')
+            try:
+                with l:
+                    w.write(f"data: {s}\n\n".encode())
+                    w.flush()
+            except Exception:
+                dead.append(entry)
+        for d in dead:
+            try:
+                sse_clients.remove(d)
+            except ValueError:
+                pass
 
 # Process tracking
 processes = {
@@ -30,6 +64,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # ── MJPEG camera stream (long-lived connection, different headers) ──
         if path == '/camera/stream':
             return self._handle_camera_stream()
+        
+        # ── Server-Sent Events for live detections ──
+        if path == '/events':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Connection', 'keep-alive')
+            self.end_headers()
+
+            # Register client
+            client = {'wfile': self.wfile, 'lock': threading.Lock()}
+            with sse_lock:
+                sse_clients.append(client)
+
+            try:
+                # Keep the connection open; block until client disconnects
+                while True:
+                    time.sleep(1)
+                    try:
+                        # send a heartbeat comment to keep some proxies happy
+                        with client['lock']:
+                            client['wfile'].write(b": heartbeat\n\n")
+                            client['wfile'].flush()
+                    except Exception:
+                        break
+            finally:
+                with sse_lock:
+                    try:
+                        sse_clients.remove(client)
+                    except ValueError:
+                        pass
+            return
         
         query = parse_qs(parsed.query)
         
@@ -50,18 +117,60 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 'camera': processes['camera'] is not None,
             }
         
+        # List available audio devices
+        elif path == '/audio-devices':
+            try:
+                devices = get_audio_devices()
+                response['success'] = True
+                response['devices'] = devices
+            except Exception as e:
+                response['success'] = False
+                response['message'] = f'Failed to list audio devices: {str(e)}'
+        
         # Start acoustic detector
         elif path == '/start/acoustic':
             if processes['acoustic'] is None:
                 try:
+                    # Allow user to specify audio device via query param: ?device=1
+                    # and microphone direction via ?mic_direction=0
+                    device_index = query.get('device', [None])[0]
+                    mic_direction = query.get('mic_direction', [None])[0]
+                    cmd = ['python3', 'acoustic_drone_detector.py']
+                    if device_index is not None:
+                        cmd.extend(['--audio-device', device_index])
+                    if mic_direction is not None:
+                        cmd.extend(['--mic-direction', mic_direction])
                     processes['acoustic'] = subprocess.Popen(
-                        ['sudo', 'python3', 'acoustic_drone_detector.py', '--audio-device', '0'],
+                        cmd,
                         stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,  # Suppress ALSA library debug noise
                         preexec_fn=os.setsid
                     )
                     response['success'] = True
                     response['message'] = 'Acoustic detector started'
+                    # Start a thread to forward JSON lines from the acoustic process stdout
+                    def _reader(proc, name):
+                        try:
+                            for raw in iter(proc.stdout.readline, b''):
+                                try:
+                                    line = raw.decode(errors='replace').strip()
+                                except Exception:
+                                    continue
+                                if not line:
+                                    continue
+                                # Try to parse JSON; otherwise forward as a LOG event
+                                try:
+                                    obj = json.loads(line)
+                                    broadcast_event(obj)
+                                except Exception:
+                                    try:
+                                        evt = {'type': 'LOG', 'source': name.upper(), 'message': line, 'timestamp': datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}
+                                        broadcast_event(evt)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    threading.Thread(target=_reader, args=(processes['acoustic'], 'acoustic'), daemon=True).start()
                 except Exception as e:
                     response['message'] = f'Failed to start: {str(e)}'
             else:
@@ -90,11 +199,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     processes['rf'] = subprocess.Popen(
                         ['python3', 'rf_drone_scanner.py', '--iface', 'wlan1'],
                         stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
                         preexec_fn=os.setsid
                     )
                     response['success'] = True
                     response['message'] = 'RF scanner started'
+                    # Thread to forward JSON lines from RF scanner stdout
+                    def _reader_rf(proc, name):
+                        try:
+                            for raw in iter(proc.stdout.readline, b''):
+                                try:
+                                    line = raw.decode(errors='replace').strip()
+                                except Exception:
+                                    continue
+                                if not line:
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                    broadcast_event(obj)
+                                except Exception:
+                                    try:
+                                        evt = {'type': 'LOG', 'source': name.upper(), 'message': line, 'timestamp': datetime.now().strftime('%Y-%m-%dT%H:%M:%S')}
+                                        broadcast_event(evt)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    threading.Thread(target=_reader_rf, args=(processes['rf'], 'rf'), daemon=True).start()
                 except Exception as e:
                     response['message'] = f'Failed to start: {str(e)}'
             else:
@@ -137,7 +268,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                             logfile.write(line.decode(errors='replace'))
                             logfile.flush()
                         logfile.close()
-                    import threading
                     t = threading.Thread(
                         target=_log_camera_output,
                         args=(processes['camera'], _camera_log),
@@ -274,6 +404,7 @@ if __name__ == '__main__':
     print(f'Dashboard backend server running on http://localhost:{port}')
     print('Available endpoints:')
     print('  GET /status')
+    print('  GET /audio-devices')
     print('  GET /start/acoustic | /stop/acoustic')
     print('  GET /start/rf | /stop/rf')
     print('  GET /start/camera | /stop/camera')

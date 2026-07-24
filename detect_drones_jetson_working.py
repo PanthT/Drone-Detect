@@ -90,128 +90,13 @@ class AsyncVideoCapture:
         self._cap.release()
 
 
-class DroneTracker:
-    """
-    CSRT-based tracker that holds a bounding box between YOLO detections.
-
-    Lifecycle:
-      - IDLE      : No drone seen yet, or tracker was lost too long.
-      - TRACKING  : YOLO fired recently; tracker is following the drone.
-      - COASTING  : YOLO missed this frame but tracker is still active.
-
-    The tracker is initialised / re-initialised every time YOLO produces a
-    confident detection.  If YOLO goes quiet for more than `max_coast_frames`
-    consecutive frames the tracker is discarded and we go back to IDLE.
-    """
-
-    # Colour used when drawing tracker-only boxes (distinct from YOLO green)
-    TRACKER_COLOR = (0, 165, 255)   # Orange
-
-    def __init__(self, max_coast_frames: int = 10):
-        """
-        Args:
-            max_coast_frames: How many consecutive frames without a YOLO hit
-                              before the tracker is abandoned.  At 30 fps,
-                              10 frames ≈ 0.33 s.
-        """
-        self.max_coast_frames = max_coast_frames
-        self._tracker = None
-        self._coast_count = 0          # frames since last YOLO detection
-        self._tracked_det = None       # last detection dict (for label/conf)
-        self.state = 'IDLE'            # 'IDLE' | 'TRACKING' | 'COASTING'
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
-
-    def update(self, frame, yolo_detections: list) -> list:
-        """
-        Given the raw YOLO detections for this frame, return the best
-        combined detection list (YOLO result OR tracker fallback).
-
-        Args:
-            frame:            Current BGR frame (numpy array).
-            yolo_detections:  List of detection dicts from detect_frame.
-
-        Returns:
-            List of detection dicts to display.  Each dict has the same
-            keys as a normal YOLO detection dict, plus 'tracked': bool.
-        """
-        if yolo_detections:
-            # ── YOLO fired ──────────────────────────────────────────────
-            # Pick the highest-confidence detection to anchor the tracker.
-            best = max(yolo_detections, key=lambda d: d['confidence'])
-            self._reinit(frame, best)
-            self._coast_count = 0
-            self.state = 'TRACKING'
-            # Tag every detection so callers know the source
-            for d in yolo_detections:
-                d['tracked'] = False
-            return yolo_detections
-
-        else:
-            # ── YOLO missed ─────────────────────────────────────────────
-            if self._tracker is None or self.state == 'IDLE':
-                return []
-
-            self._coast_count += 1
-            if self._coast_count > self.max_coast_frames:
-                self._reset()
-                return []
-
-            # Ask the tracker where the drone went
-            success, bbox = self._tracker.update(frame)
-            if not success:
-                self._reset()
-                return []
-
-            x, y, w, h = [int(v) for v in bbox]
-            x2, y2 = x + w, y + h
-            # Keep bbox inside frame
-            fh, fw = frame.shape[:2]
-            x  = max(0, x);  y  = max(0, y)
-            x2 = min(fw, x2); y2 = min(fh, y2)
-
-            self.state = 'COASTING'
-            tracked_det = {
-                'class':      self._tracked_det['class'],
-                'confidence': self._tracked_det['confidence'],
-                'bbox':       np.array([x, y, x2, y2], dtype=np.float32),
-                'center':     ((x + x2) / 2, (y + y2) / 2),
-                'tracked':    True,   # drawn differently in _draw_detections
-            }
-            return [tracked_det]
-
-    def reset(self):
-        """Externally force the tracker back to IDLE (e.g. on scene cut)."""
-        self._reset()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _reinit(self, frame, detection: dict):
-        """Create a fresh CSRT tracker seeded from a YOLO bbox."""
-        x1, y1, x2, y2 = detection['bbox'].astype(int)
-        bbox_xywh = (x1, y1, x2 - x1, y2 - y1)
-        self._tracker = cv2.TrackerCSRT_create()
-        self._tracker.init(frame, bbox_xywh)
-        self._tracked_det = detection
-
-    def _reset(self):
-        self._tracker = None
-        self._coast_count = 0
-        self._tracked_det = None
-        self.state = 'IDLE'
-
-
 class JetsonDroneDetector:
+
     """Jetson Orin Nano optimized drone detector."""
     
-    def __init__(self, model_size='n', confidence_threshold=0.3, iou_threshold=0.45,
-                 use_tensorrt=True, fp16=True, monitor_thermal=True,
-                 frame_skip=2, imgsz=640, use_tracker=True, tracker_coast_frames=10,
-                 debug=False):
+    def __init__(self, model_size='n', confidence_threshold=0.77, iou_threshold=0.45,
+                 use_tensorrt=True, fp16=True, int8=False, monitor_thermal=True,
+                 frame_skip=2, imgsz=416, debug=False):
         """
         Initialize the Jetson-optimized drone detector.
         
@@ -221,17 +106,16 @@ class JetsonDroneDetector:
             iou_threshold: IoU threshold for NMS
             use_tensorrt: Convert and use TensorRT engine for faster inference
             fp16: Use FP16 precision (highly recommended for Jetson)
+            int8: Use INT8 precision with TensorRT (Jetson only; may require support
+                  from the installed TensorRT/Ultralytics runtime).
             monitor_thermal: Monitor temperature and throttle if needed
             frame_skip: Run inference every (frame_skip+1) frames, reusing last result.
                         Default raised from 0→2: inference runs every 3rd frame while
-                        the CSRT tracker fills the gaps, giving ~3× display FPS with
-                        no perceptible detection lag.  Set to 0 to run every frame.
-            imgsz: Inference image size. Defaults to 832 to match the trained
-                   model's training resolution — mismatching this causes internal
-                   rescaling and hurts both speed and accuracy.
-            use_tracker: Enable CSRT tracker to hold detections between YOLO hits
-            tracker_coast_frames: Frames the tracker keeps running after YOLO last
-                                  fired before it gives up (default 10 ≈ 0.33 s @ 30fps)
+                        the pipeline reuses previous frame outputs, giving higher
+                        display FPS with no perceptible detection lag. Set to 0 to
+                        run every frame.
+            imgsz: Inference image size in pixels. Lower values are faster; 416 is
+                   a good speed/accuracy tradeoff for Jetson.
         """
         print("="*70)
         print("🚀 Jetson Orin Nano Drone Detection System")
@@ -250,19 +134,12 @@ class JetsonDroneDetector:
         self.iou_threshold = iou_threshold
         self.use_tensorrt = use_tensorrt and self.is_jetson
         self.fp16 = fp16
+        self.use_int8 = int8 and self.is_jetson
         self.frame_skip = frame_skip
         self.imgsz = imgsz
         self._skip_counter = 0
         self._last_detections = []
         self.debug = debug
-
-        # Tracker setup
-        self.use_tracker = use_tracker
-        if use_tracker:
-            self.tracker = DroneTracker(max_coast_frames=tracker_coast_frames)
-            print(f"🎯 CSRT tracker enabled (coast={tracker_coast_frames} frames)")
-        else:
-            self.tracker = None
         
         # Model setup - check for trained model first
         print(f"\n📦 Loading model...")
@@ -406,19 +283,24 @@ class JetsonDroneDetector:
                 # Export to TensorRT — use self.imgsz so the engine matches
                 # the inference size used at runtime.  A 320-px engine is
                 # ~2–3× faster than a 640-px one with minimal accuracy loss.
-                self.model.export(
-                    format='engine',
-                    half=self.fp16,
-                    imgsz=self.imgsz,   # was hardcoded to 640
-                    workspace=4,        # 4 GB workspace for Jetson Orin Nano
-                    device=0
-                )
+                export_kwargs = {
+                    'format': 'engine',
+                    'imgsz': self.imgsz,   # was hardcoded to 640
+                    'workspace': 4,        # 4 GB workspace for Jetson Orin Nano
+                    'device': 0
+                }
+                if self.use_int8:
+                    export_kwargs['int8'] = True
+                    print('  Exporting INT8 TensorRT engine...')
+                else:
+                    export_kwargs['half'] = self.fp16
+
+                self.model.export(**export_kwargs)
                 
                 # Load TensorRT model
                 self.model = YOLO(trt_path, task='detect')
                 print(f"✓ TensorRT engine created: {trt_path}")
                 print("  (This engine is cached for future use)")
-        
         except Exception as e:
             print(f"⚠️  TensorRT optimization failed: {e}")
             print("  Falling back to standard CUDA inference")
@@ -558,11 +440,7 @@ class JetsonDroneDetector:
             self._skip_counter += 1
             if self._skip_counter <= self.frame_skip:
                 skip_start = time.time()
-                # Still update tracker on skipped frames so it doesn't drift
-                if self.tracker is not None:
-                    skipped_dets = self.tracker.update(frame, [])
-                else:
-                    skipped_dets = self._last_detections
+                skipped_dets = self._last_detections
                 annotated_frame = self._draw_detections(frame, skipped_dets, inplace=True)
                 inference_time = (time.time() - skip_start) * 1000
                 return annotated_frame, skipped_dets, inference_time
@@ -583,10 +461,9 @@ class JetsonDroneDetector:
                 frame,
                 conf=self.conf_threshold,
                 imgsz=self.imgsz,
-                verbose=False,
-                stream=True
+                verbose=False
             )
-            result = next(iter(results))  # inference actually executes here
+            result = results[0]
         inference_time = (time.time() - inference_start) * 1000
         self.inference_times.append(inference_time)
 
@@ -623,10 +500,6 @@ class JetsonDroneDetector:
         
         self._last_detections = drone_detections  # Cache for frame-skip reuse
 
-        # ── Tracker: supplement YOLO with CSRT when it misses ────────────
-        if self.tracker is not None:
-            drone_detections = self.tracker.update(frame, drone_detections)
-
         # Create annotated frame
         annotated_frame = self._draw_detections(frame, drone_detections, inplace=True)
         
@@ -653,25 +526,9 @@ class JetsonDroneDetector:
             x1, y1, x2, y2 = map(int, det['bbox'])
             cls_name = det['class']
             conf = det['confidence']
-            is_tracked = det.get('tracked', False)
-
-            # Tracked-only boxes are drawn in orange with a dotted border style
-            # to distinguish them from solid YOLO detections
-            if is_tracked:
-                color = DroneTracker.TRACKER_COLOR
-                # Draw dashed rectangle by drawing corner segments
-                seg = 20   # segment length in pixels
-                thickness = 2
-                for (px, py) in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
-                    dx = 1 if px == x1 else -1
-                    dy = 1 if py == y1 else -1
-                    cv2.line(annotated_frame, (px, py), (px + dx * seg, py), color, thickness)
-                    cv2.line(annotated_frame, (px, py), (px, py + dy * seg), color, thickness)
-                label = f"TRACKING {conf:.2f}"
-            else:
-                color = color_map.get(cls_name, (0, 255, 0))
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
-                label = f"{cls_name.upper()} {conf:.2f}"
+            color = color_map.get(cls_name, (0, 255, 0))
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 2)
+            label = f"{cls_name.upper()} {conf:.2f}"
             
             # Draw center dot
             center = (int(det['center'][0]), int(det['center'][1]))
@@ -922,18 +779,6 @@ class JetsonDroneDetector:
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, det_color, 2)
         y += spacing
 
-        # Tracker state
-        if self.tracker is not None:
-            state = self.tracker.state
-            if state == 'TRACKING':
-                t_color, t_text = (0, 255, 0), 'TRACKER: LOCK'
-            elif state == 'COASTING':
-                t_color, t_text = DroneTracker.TRACKER_COLOR, f'TRACKER: COAST ({self.tracker._coast_count}/{self.tracker.max_coast_frames})'
-            else:
-                t_color, t_text = (180, 180, 180), 'TRACKER: IDLE'
-            cv2.putText(frame, t_text, (10, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.55, t_color, 2)
-        
         # Temperature warning
         if self.monitor_thermal and self.thermal_throttle:
             cv2.putText(frame, "THERMAL THROTTLE", (10, frame.shape[0] - 20),
@@ -1003,8 +848,8 @@ Examples:
     parser.add_argument('-m', '--model', type=str, default='n',
                        choices=['n', 's'],
                        help='Model size (n=nano/fastest, s=small) (default: n)')
-    parser.add_argument('-c', '--confidence', type=float, default=0.3,
-                       help='Confidence threshold (default: 0.3)')
+    parser.add_argument('-c', '--confidence', type=float, default=0.77,
+                       help='Confidence threshold (default: 0.77)')
     parser.add_argument('--tensorrt', action='store_true',
                        help='Use TensorRT optimization (recommended)')
     parser.add_argument('--fp16', action='store_true',
@@ -1030,20 +875,20 @@ Examples:
     parser.add_argument('--frame-skip', type=int, default=2,
                        help='Skip N frames between inferences (0=every frame, '
                             '1=every other frame, 2=every 3rd frame). Boosts display '
-                            'FPS; CSRT tracker fills the gaps. (default: 2)')
-    parser.add_argument('--imgsz', type=int, default=640,
-                       help='Inference image size in pixels (default: 640)')
+                            'FPS by reusing recent output. (default: 2)')
+    parser.add_argument('--imgsz', type=int, default=416,
+                       help='Inference image size in pixels (default: 416)')
+    parser.add_argument('--int8', action='store_true',
+                       help='Use INT8 TensorRT precision on Jetson (requires --tensorrt).')
     parser.add_argument('--debug', action='store_true',
                        help='Print every raw model detection to console — useful for '
                             'diagnosing why drones are not being detected (class names, '
                             'confidence scores, filter matches)')
-    parser.add_argument('--no-tracker', action='store_true',
-                       help='Disable CSRT tracker (tracker is on by default)')
-    parser.add_argument('--tracker-coast', type=int, default=10,
-                       help='Frames the tracker keeps running after YOLO last fired '
-                            'before giving up. Higher = longer coasting. (default: 10)')
     
     args = parser.parse_args()
+
+    if args.int8 and not args.tensorrt:
+        parser.error('--int8 requires --tensorrt')
     
     # Set power mode if requested
     if args.power_mode:
@@ -1067,11 +912,11 @@ Examples:
     print(f"Source: {source}")
     print(f"Model: best.pt")
     print(f"TensorRT: {args.tensorrt}")
+    print(f"INT8: {args.int8}")
     print(f"FP16: {args.fp16}")
     print(f"GStreamer: {args.gstreamer}")
     print(f"Frame skip: {args.frame_skip} (inference every {args.frame_skip+1} frames)")
     print(f"Inference size: {args.imgsz}px")
-    print(f"Tracker: {'disabled' if args.no_tracker else f'enabled (coast={args.tracker_coast})'}")
     print("="*70 + "\n")
     
     try:
@@ -1084,8 +929,7 @@ Examples:
             monitor_thermal=not args.no_thermal,
             frame_skip=args.frame_skip,
             imgsz=args.imgsz,
-            use_tracker=not args.no_tracker,
-            tracker_coast_frames=args.tracker_coast,
+            int8=args.int8,
             debug=args.debug
         )
         

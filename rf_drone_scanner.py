@@ -107,9 +107,42 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 # Threat scoring
 # ---------------------------------------------------------------------------
 
-def score_network(net: dict) -> tuple[int, list[str]]:
+def infer_source(net: dict) -> str:
+    """Return a human-readable likely source for the RF signal."""
+    ssid_upper = net["ssid"].upper()
+    freq = net["frequency_ghz"]
+    ch = net["channel"]
+    dbm = net["signal_dbm"]
+    oui = net["bssid"][:8].upper() if len(net["bssid"]) >= 8 else ""
+
+    for pattern, _ in DRONE_SSID_PATTERNS:
+        if re.search(pattern, ssid_upper):
+            return "Drone hotspot / control link" if freq >= 5.0 else "Drone control hotspot"
+
+    if oui in DRONE_OUIS:
+        return "DJI drone radio" if freq < 5.0 else "DJI 5 GHz video link"
+
+    if freq >= 5.1 and ch in DRONE_5GHZ_CHANNELS:
+        return "5 GHz drone video uplink"
+
+    if 2.3 <= freq < 5.0 and dbm >= STRONG_SIGNAL_DBM:
+        return "Nearby RC transmitter"
+
+    if not net["encryption"] and freq >= 2.3:
+        return "Open WiFi hotspot"
+
+    if freq >= 5.0:
+        return "5 GHz WiFi / video source"
+
+    if 2.3 <= freq < 5.0:
+        return "2.4 GHz WiFi / RC source"
+
+    return "Generic RF source"
+
+
+def score_network(net: dict) -> tuple[int, list[str], str]:
     """
-    Return (score, reasons).  Score thresholds:
+    Return (score, reasons, source).  Score thresholds:
         0        → not interesting
         1–2      → LOW
         3–4      → MEDIUM
@@ -152,7 +185,8 @@ def score_network(net: dict) -> tuple[int, list[str]]:
         score += 1
         reasons.append("Open (unencrypted) WiFi — consistent with drone hotspot")
 
-    return score, reasons
+    source = infer_source(net)
+    return score, reasons, source
 
 
 def threat_level(score: int) -> str:
@@ -184,6 +218,7 @@ def parse_iwlist(raw: str) -> list[dict]:
             "score":         0,
             "threat":        "CLEAR",
             "reasons":       [],
+            "source":        "Generic RF source",
         }
 
         m = re.search(r"Address:\s*([0-9A-Fa-f:]{17})", cell)
@@ -214,7 +249,7 @@ def parse_iwlist(raw: str) -> list[dict]:
 
         net["encryption"] = "Encryption key:on" in cell
 
-        net["score"], net["reasons"] = score_network(net)
+        net["score"], net["reasons"], net["source"] = score_network(net)
         net["threat"] = threat_level(net["score"])
 
         networks.append(net)
@@ -344,6 +379,38 @@ class RFScanner:
                     self._scan_ms     = elapsed_ms
                     self._reconnecting = current_ssid is not None
 
+                # Emit a compact JSON summary line for external dashboards
+                try:
+                    def _bssid_to_deg(bssid: str) -> int:
+                        # Stable-ish conversion from BSSID hex to 0-359 degrees
+                        s = ''.join(ch for ch in (bssid or '') if ch in '0123456789ABCDEFabcdef')
+                        if not s:
+                            return -1
+                        total = sum(int(c, 16) for c in s)
+                        return int(total) % 360
+
+                    top = alerts[0] if len(alerts) > 0 else None
+                    summary = {
+                        'type': 'RF',
+                        'timestamp': datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+                        'scan_count': self._scan_count,
+                        'scan_ms': round(elapsed_ms, 1),
+                        'top_alert': None,
+                        'direction_deg': -1,
+                    }
+                    if top:
+                        summary['top_alert'] = {
+                            'ssid': top.get('ssid',''),
+                            'bssid': top.get('bssid',''),
+                            'freq': top.get('frequency_ghz',0.0),
+                            'dbm': top.get('signal_dbm',-100),
+                            'threat': top.get('threat','CLEAR'),
+                        }
+                        summary['direction_deg'] = _bssid_to_deg(top.get('bssid',''))
+                    print(json.dumps(summary), flush=True)
+                except Exception:
+                    pass
+
                 # 4. Reconnect if we were associated before
                 if current_ssid:
                     self._reconnect(current_ssid)
@@ -437,6 +504,7 @@ def run_dashboard(stdscr, scanner: RFScanner, logger: logging.Logger,
                 ssid = a["ssid"] if a["ssid"] else "<hidden>"
                 msg  = (f"NEW ALERT [{a['threat']}] score={a['score']}  "
                         f"SSID={ssid}  BSSID={bid}  "
+                        f"source={a['source']}  "
                         f"{a['frequency_ghz']:.3f}GHz  ch{a['channel']}  "
                         f"{a['signal_dbm']}dBm  "
                         f"reasons={'; '.join(a['reasons'])}")
@@ -477,7 +545,7 @@ def run_dashboard(stdscr, scanner: RFScanner, logger: logging.Logger,
         row += 1
 
         # column headers
-        col_hdr = (f"  {'THREAT':<10} {'SSID':<24} {'BSSID':<19} "
+        col_hdr = (f"  {'THREAT':<10} {'SSID':<24} {'SRC':<18} {'BSSID':<19} "
                    f"{'GHz':>6} {'CH':>4} {'dBm':>5}  SIGNAL")
         stdscr.addstr(row, 0, col_hdr[:max_x - 1], curses.A_UNDERLINE)
         row += 1
@@ -493,10 +561,11 @@ def run_dashboard(stdscr, scanner: RFScanner, logger: logging.Logger,
             threat = net["threat"]
             cp     = curses.color_pair(THREAT_COLORS.get(threat, THREAT_COLORS["CLEAR"]))
             ssid   = (net["ssid"] if net["ssid"] else "<hidden>")[:23]
+            source = (net.get("source", "Generic RF source") or "Generic RF source")[:17]
             bar    = dbm_bar(net["signal_dbm"], width=16)
             enc    = "" if net["encryption"] else " 🔓"
 
-            line = (f"  {threat:<10} {ssid:<24} {net['bssid']:<19} "
+            line = (f"  {threat:<10} {ssid:<24} {source:<18} {net['bssid']:<19} "
                     f"{net['frequency_ghz']:>6.3f} {net['channel']:>4} "
                     f"{net['signal_dbm']:>5}  {bar}{enc}")
             stdscr.addstr(row, 0, line[:max_x - 1], cp)

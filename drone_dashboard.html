@@ -304,6 +304,56 @@
 
   .sep { width: 1px; height: 20px; background: var(--border); flex-shrink: 0; }
 
+  /* ── Microphone select ── */
+  .mic-select {
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-family: var(--font);
+    cursor: pointer;
+    max-width: 180px;
+    appearance: auto;
+  }
+  .mic-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .mic-select option {
+    background: var(--bg2);
+    color: var(--text);
+  }
+
+  /* ── Microphone direction input ── */
+  .mic-dir-input {
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 11px;
+    font-family: var(--font);
+    cursor: pointer;
+    width: 52px;
+    text-align: center;
+  }
+  .mic-dir-input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .mic-dir-label {
+    font-size: 10px;
+    color: var(--muted);
+    margin-left: 4px;
+  }
+  .mic-dir-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
   /* ── Footer ── */
   .footer {
     padding: 12px 24px;
@@ -336,6 +386,13 @@
       <div class="toggle-switch" id="tog-acoustic"></div>
       <span style="color:var(--purple);">Acoustic</span>
     </label>
+    <select id="mic-select" class="mic-select" onclick="event.stopPropagation();" onchange="onMicChanged()" disabled>
+      <option value="">— mic —</option>
+    </select>
+    <div class="mic-dir-group">
+      <input type="number" id="mic-direction" class="mic-dir-input" value="0" min="0" max="359" onclick="event.stopPropagation();" onchange="onMicDirectionChanged()" disabled title="Microphone direction in degrees (0=front, 90=right, 180=back, 270=left)">
+      <span class="mic-dir-label">°</span>
+    </div>
     <div class="sep"></div>
     <label class="toggle-label" onclick="toggleSensor('rf')">
       <div class="toggle-switch" id="tog-rf"></div>
@@ -389,6 +446,14 @@
         <div style="font-size:10px; color:var(--muted); margin-bottom:4px;">FFT Spectrum · Decibel levels</div>
         <div class="spectrum" id="spectrum"></div>
         <div class="spectrum-label"><span>-60 dB</span><span>-30 dB</span><span>0 dB</span></div>
+
+        <div style="display:flex; justify-content:center; margin-top:12px;">
+          <div style="width:140px; display:flex; flex-direction:column; align-items:center;">
+            <div style="font-size:10px; color:var(--muted); margin-bottom:6px;">Acoustic Direction</div>
+            <canvas id="ac-compass" width="140" height="140" style="width:140px;height:140px;border-radius:6px;background:transparent;"></canvas>
+          </div>
+        </div>
+
         <div style="margin-top: 12px;">
           <div style="font-size:10px; color:var(--muted); margin-bottom:6px;">Harmonic series</div>
           <div class="harmonic-bars" id="harmonics"></div>
@@ -421,6 +486,10 @@
         </div>
       </div>
       <div class="card-body" style="padding:0;">
+        <div style="padding:12px 16px;">
+          <div style="font-size:10px; color:var(--muted); margin-bottom:6px;">RF Direction</div>
+          <canvas id="rf-compass" width="160" height="100" style="width:160px;height:100px;background:transparent;"></canvas>
+        </div>
         <table class="rf-table" id="rf-table">
           <thead>
             <tr>
@@ -532,32 +601,13 @@ const state = {
   alertMode: false,
   alertTimer: 0,
   cameraStreamActive: false,
+  selectedMic: '',
 };
-
-// ── RF network pool ────────────────────────────────────────────────────────
-const rfPool = [
-  { ssid: 'DJI_Mavic3_8F2A', freq: 5.745, ch: 149, dbm: -52, enc: false,  threat: 'CRITICAL' },
-  { ssid: 'Phantom4_RC_Link', freq: 5.180, ch: 36,  dbm: -61, enc: false,  threat: 'HIGH' },
-  { ssid: 'MINI-3-Pro_7C1B', freq: 2.432, ch: 5,   dbm: -68, enc: false,  threat: 'HIGH' },
-  { ssid: 'Autel_Evo2_A4D1', freq: 5.200, ch: 40,  dbm: -74, enc: false,  threat: 'MEDIUM' },
-  { ssid: 'TELLOADAPTER',    freq: 2.412, ch: 1,   dbm: -78, enc: false,  threat: 'MEDIUM' },
-  { ssid: 'Xfinity_Home',    freq: 2.437, ch: 6,   dbm: -71, enc: true,   threat: 'CLEAR' },
-  { ssid: 'BELL_5G_EF92',    freq: 5.500, ch: 100, dbm: -66, enc: true,   threat: 'CLEAR' },
-  { ssid: 'AndroidAP_9A2C',  freq: 2.462, ch: 11,  dbm: -81, enc: true,   threat: 'CLEAR' },
-  { ssid: 'FPV_Racer_02',    freq: 5.745, ch: 149, dbm: -58, enc: false,  threat: 'HIGH' },
-  { ssid: '<hidden>',        freq: 5.260, ch: 52,  dbm: -83, enc: true,   threat: 'LOW' },
-];
-
-// ── Drone SSID patterns (for alert simulation) ─────────────────────────────
-const DRONE_SSIDS = rfPool.filter(n => n.threat !== 'CLEAR');
-const CLEAR_SSIDS = rfPool.filter(n => n.threat === 'CLEAR');
 
 // ── Harmonic frequencies ───────────────────────────────────────────────────
 const harmonicLabels = ['1F · -12 dB','2F · -18 dB','3F · -24 dB','4F · -30 dB','5F · -36 dB'];
 
 // ── Helpers ────────────────────────────────────────────────────────────────
-function rand(a, b) { return Math.random() * (b - a) + a; }
-function randInt(a, b) { return Math.floor(rand(a, b+1)); }
 function now() {
   const d = new Date();
   return [d.getHours(), d.getMinutes(), d.getSeconds()]
@@ -572,6 +622,50 @@ function tickClock() {
   const h = Math.floor(up/3600), m = Math.floor((up%3600)/60), s = up%60;
   document.getElementById('uptime-display').textContent =
     `Uptime: ${h ? h+'h ' : ''}${m ? m+'m ' : ''}${s}s`;
+}
+
+// ── Microphone selection ──────────────────────────────────────────────────
+function fetchAudioDevices() {
+  const select = document.getElementById('mic-select');
+  fetch('http://localhost:9000/audio-devices')
+    .then(res => res.json())
+    .then(data => {
+      if (data.success && data.devices && data.devices.length > 0) {
+        select.innerHTML = '<option value="">— mic —</option>' +
+          data.devices.map(d =>
+            `<option value="${d.index}">${d.index}: ${d.name}</option>`
+          ).join('');
+        select.disabled = false;
+      } else {
+        select.innerHTML = '<option value="">no mics found</option>';
+        select.disabled = true;
+      }
+    })
+    .catch(() => {
+      select.innerHTML = '<option value="">server down</option>';
+      select.disabled = true;
+    });
+}
+
+function onMicChanged() {
+  const select = document.getElementById('mic-select');
+  const dirInput = document.getElementById('mic-direction');
+  state.selectedMic = select.value;
+  if (state.selectedMic) {
+    dirInput.disabled = false;
+    addLog('ACOUSTIC', `Microphone selected: device ${state.selectedMic} (direction: ${dirInput.value}°)`, 'INFO');
+  } else {
+    dirInput.disabled = true;
+  }
+}
+
+function onMicDirectionChanged() {
+  const dirInput = document.getElementById('mic-direction');
+  // Clamp to 0-359
+  let val = parseInt(dirInput.value) || 0;
+  val = Math.max(0, Math.min(359, val));
+  dirInput.value = val;
+  addLog('ACOUSTIC', `Microphone direction set to ${val}° (0=front, 90=right, 180=back, 270=left)`, 'INFO');
 }
 
 // ── Log ───────────────────────────────────────────────────────────────────
@@ -654,8 +748,16 @@ function toggleSensor(name) {
       setTimeout(() => connectCameraStream(), 500);
     }
     
+    // Build URL with optional device and direction query params for acoustic
+    let url = `http://localhost:9000/start/${name}`;
+    if (name === 'acoustic' && state.selectedMic) {
+      const dirInput = document.getElementById('mic-direction');
+      const dir = dirInput ? parseInt(dirInput.value) || 0 : 0;
+      url += `?device=${state.selectedMic}&mic_direction=${dir}`;
+    }
+    
     // Start the detector process via backend
-    fetch(`http://localhost:9000/start/${name}`)
+    fetch(url)
       .then(res => res.json())
       .then(data => {
         if (data.success) {
@@ -675,6 +777,9 @@ function toggleSensor(name) {
         state.sensors[name] = false;
         if (name === 'camera') disconnectCameraStream();
       });
+    // Show immediate listening indicator on the compass visual
+    if (name === 'acoustic') drawCompass('ac-compass', -1, 'Listening');
+    if (name === 'rf') drawCompass('rf-compass', -1, 'Scanning');
   } else {
     tog.classList.remove('on');
     dot.className = 'status-dot dot-idle';
@@ -696,6 +801,9 @@ function toggleSensor(name) {
       .catch(err => {
         // Silently fail on stop
       });
+    // Clear compass visuals when turning off
+    if (name === 'acoustic') drawCompass('ac-compass', null, '');
+    if (name === 'rf') drawCompass('rf-compass', null, '');
   }
 }
 
@@ -724,23 +832,9 @@ function initSpectrum() {
   }
 }
 
-function updateSpectrum(dronePresent) {
-  for (let i = 0; i < 40; i++) {
-    const bar = document.getElementById(`sb-${i}`);
-    if (!bar) continue;
-    let h;
-    if (dronePresent && i >= 5 && i <= 35) {
-      // harmonic peaks at ~i=5,10,15,20,25 with noise
-      const harmonicPos = [5,10,15,20,25];
-      const near = harmonicPos.some(p => Math.abs(i - p) <= 1);
-      h = near ? rand(55, 95) : rand(5, 25);
-      bar.classList.toggle('hot', near && rand(0,1) > 0.3);
-    } else {
-      h = rand(3, 20);
-      bar.classList.remove('hot');
-    }
-    bar.style.height = h + '%';
-  }
+function updateSpectrum() {
+  // FFT spectrum is updated via real data from the backend EventSource.
+  // This function is a no-op unless real detection data is available.
 }
 
 // ── Harmonics ─────────────────────────────────────────────────────────────
@@ -754,16 +848,9 @@ function initHarmonics() {
     </div>`).join('');
 }
 
-function updateHarmonics(dronePresent) {
-  for (let i = 0; i < 5; i++) {
-    const bar = document.getElementById(`hb-${i}`);
-    const val = document.getElementById(`hv-${i}`);
-    if (!bar || !val) continue;
-    const v = dronePresent ? rand(45, 85) - i*8 : rand(2, 15);
-    bar.style.width = v + '%';
-    const db = dronePresent ? (rand(18, 36) - i*4).toFixed(1) : rand(0,6).toFixed(1);
-    val.textContent = db + ' dB';
-  }
+function updateHarmonics() {
+  // Harmonic data is updated via real data from the backend EventSource.
+  // This function is a no-op unless real detection data is available.
 }
 
 // ── RF Table ──────────────────────────────────────────────────────────────
@@ -898,16 +985,160 @@ function setTrackerState(s, coast) {
 // ── Boot ───────────────────────────────────────────────────────────────────
 initSpectrum();
 initHarmonics();
+// Initialize compass visuals to unknown state
+drawCompass('ac-compass', null, '');
+drawCompass('rf-compass', null, '');
 
-// Initial RF table is empty until real RF scanner data is available.
+// ── Direction visuals ──────────────────────────────────────────────────────
+function drawCompass(canvasId, deg, label) {
+  const c = document.getElementById(canvasId);
+  if (!c) return;
+  const ctx = c.getContext('2d');
+  const W = c.width; const H = c.height;
+  ctx.clearRect(0,0,W,H);
+  const cx = W/2, cy = H/2, r = Math.min(W,H)/2 - 8;
+
+  // Circle
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fillStyle='rgba(255,255,255,0.02)'; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.06)'; ctx.lineWidth=1; ctx.stroke();
+
+  // N marker
+  ctx.fillStyle='var(--muted)'; ctx.font='10px monospace'; ctx.textAlign='center'; ctx.fillText('N', cx, cy - r + 12);
+
+  if (deg === undefined || deg === null || deg < 0) {
+    // Draw a subtle listening indicator (pulsing ring)
+    ctx.beginPath(); ctx.arc(cx, cy, r-6, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(59,130,246,0.03)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(59,130,246,0.12)'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle='rgba(255,255,255,0.25)'; ctx.font='12px monospace'; ctx.fillText(label || 'Unknown', cx, cy+4);
+    return;
+  }
+
+  // Arrow
+  const a = (deg - 90) * Math.PI/180; // rotate so 0deg points up
+  const ax = cx + Math.cos(a) * (r-10);
+  const ay = cy + Math.sin(a) * (r-10);
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ax, ay);
+  ctx.strokeStyle='rgba(59,130,246,0.9)'; ctx.lineWidth=4; ctx.lineCap='round'; ctx.stroke();
+
+  // Arrowhead
+  ctx.beginPath(); ctx.moveTo(ax, ay);
+  ctx.lineTo(ax - Math.cos(a - 0.4)*12, ay - Math.sin(a - 0.4)*12);
+  ctx.lineTo(ax - Math.cos(a + 0.4)*12, ay - Math.sin(a + 0.4)*12);
+  ctx.fillStyle='rgba(59,130,246,0.95)'; ctx.fill();
+
+  // Draw a filled sector to highlight direction (60° cone)
+  ctx.beginPath();
+  const cone = 30 * Math.PI/180; // +/-30deg
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, r-4, a - cone, a + cone);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(59,130,246,0.12)';
+  ctx.fill();
+
+  // Label
+  if (label) {
+    ctx.fillStyle='var(--muted)'; ctx.font='11px monospace'; ctx.textAlign='center';
+    ctx.fillText(label + ' · ' + deg + '°', cx, cy + r - 6);
+  }
+}
+
+// Open EventSource to receive detection JSON from dashboard_server
+try {
+  const es = new EventSource('http://localhost:9000/events');
+  es.onmessage = (ev) => {
+    try {
+      const obj = JSON.parse(ev.data);
+      if (obj.type === 'ACOUSTIC') {
+        drawCompass('ac-compass', obj.direction_deg, 'Acoustic');
+        addLog('ACOUSTIC', `Detected · ${obj.fundamental_hz}Hz · ${obj.harmonics} harmonics · ${obj.energy_pct}% band energy · area: ${obj.area_hint}`, 'INFO');
+        // Increment positive/alerts when a detection JSON arrives
+        try {
+          const alertsEl = document.getElementById('ac-alerts');
+          const positiveEl = document.getElementById('ac-positive');
+          const framesEl = document.getElementById('ac-frames');
+          if (alertsEl) alertsEl.textContent = String(Number(alertsEl.textContent || '0') + 1);
+          if (positiveEl) positiveEl.textContent = String(Number(positiveEl.textContent || '0') + 1);
+        } catch(e){}
+      } else if (obj.type === 'RF') {
+        drawCompass('rf-compass', obj.direction_deg, 'RF');
+        // Always update scan count, regardless of whether there's an alert
+        if (obj.scan_count !== undefined) {
+          const scansEl = document.getElementById('rf-scans');
+          if (scansEl) scansEl.textContent = String(obj.scan_count);
+        }
+        if (obj.top_alert) {
+          addLog('RF', `Top: ${obj.top_alert.ssid}  ${obj.top_alert.freq}GHz  ${obj.top_alert.dbm}dBm  threat: ${obj.top_alert.threat}`, 'INFO');
+          // Populate the RF table with the top alert + any additional context
+          try {
+            state.rf.nets = [];
+            // Add the top alert to the table if it's not CLEAR
+            if (obj.top_alert.threat !== 'CLEAR') {
+              state.rf.nets.push({
+                ssid: obj.top_alert.ssid || '<hidden>',
+                freq: obj.top_alert.freq,
+                dbm: obj.top_alert.dbm,
+                threat: obj.top_alert.threat,
+              });
+            }
+            updateRFTable();
+            // Update RF net count and alerts
+            const netsEl = document.getElementById('rf-nets');
+            const alertsEl = document.getElementById('rf-alerts');
+            if (netsEl) netsEl.textContent = String(state.rf.nets.length);
+            if (alertsEl && obj.top_alert && obj.top_alert.threat !== 'CLEAR') {
+              alertsEl.textContent = String(Number(alertsEl.textContent || '0') + 1);
+            }
+          } catch(e){}
+        }
+      } else if (obj.type === 'LOG') {
+        const src = (obj.source || 'SYS').toUpperCase();
+        const msg = obj.message || obj.msg || JSON.stringify(obj);
+        // Choose level by simple heuristics
+        const level = /error|failed|warn|exception/i.test(msg) ? 'ERROR' : 'INFO';
+        addLog(src, msg, level);
+        // Parse acoustic stats lines like: "Frames: 123 | Positive: 5 (4.1%) | Alerts: 2"
+        if (src === 'ACOUSTIC') {
+          try {
+            const m = msg.match(/Frames:\s*(\d+)\s*\|\s*Positive:\s*(\d+).*?\|\s*Alerts:\s*(\d+)/i);
+            if (m) {
+              const frames = Number(m[1]);
+              const positive = Number(m[2]);
+              const alerts = Number(m[3]);
+              const fEl = document.getElementById('ac-frames');
+              const pEl = document.getElementById('ac-positive');
+              const aEl = document.getElementById('ac-alerts');
+              if (fEl) fEl.textContent = String(frames);
+              if (pEl) pEl.textContent = String(positive);
+              if (aEl) aEl.textContent = String(alerts);
+            }
+          } catch(e){}
+        }
+      } else {
+        // Unknown event type: show as generic info
+        addLog('EVENT', JSON.stringify(obj), 'INFO');
+      }
+    } catch(e) {
+      // ignore parse errors
+    }
+  };
+  es.onerror = (e) => {
+    // no-op for now
+  };
+} catch(e) {
+  // EventSource not available
+}
+
+// Initial RF table is empty — data comes from the backend scanner.
 state.rf.nets = [];
 updateRFTable();
 
-addLog('RF', 'Live RF feed requires dashboard backend. Run python3 dashboard_server.py, then toggle RF switch', 'INFO');
-addLog('ACOUSTIC', 'Live acoustic feed requires dashboard backend. Run python3 dashboard_server.py, then toggle Acoustic switch', 'INFO');
-addLog('CAMERA', 'Camera stream via MJPEG over dashboard_server.py:9000/camera/stream', 'INFO');
+addLog('SYSTEM', 'Dashboard ready. Use the toggle switches to start/stop detectors, or run python3 dashboard_server.py', 'INFO');
 
-setInterval(tick, 500);
+// Fetch available audio devices on page load
+setTimeout(fetchAudioDevices, 1000);
+
+// Clock and uptime tick only (no simulated detection data)
 setInterval(tickClock, 1000);
 </script>
 </body>

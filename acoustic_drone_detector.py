@@ -30,6 +30,7 @@ from datetime import datetime
 from collections import deque
 import sys
 import warnings
+import json
 
 # ── Acoustic dependencies ────────────────────────────────────────────────────
 NUMPY_AVAILABLE = False
@@ -163,6 +164,57 @@ ACOUSTIC_HISTORY  = 30
 # Acoustic detector
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def classify_acoustic_source(fundamental_hz: float) -> str:
+    """Map a detected tonal fundamental to the likely drone sound source."""
+    if fundamental_hz <= 0:
+        return "unknown acoustic source"
+    if fundamental_hz < 140:
+        return "propeller/rotor blade-pass tone"
+    if fundamental_hz < 400:
+        return "motor/ESC tone"
+    if fundamental_hz < 900:
+        return "frame resonance / vibration"
+    return "high-frequency structural vibration"
+
+
+def classify_acoustic_area(energy_ratio: float, avg_band_db: float,
+                           peak_db_level: float) -> str:
+    """Provide a broad area hint from the signal strength.
+
+    No longer uses device label keywords — direction is configured by the user
+    via the --mic-direction argument, and the numeric direction_deg is set
+    independently based on signal strength proximity.
+    """
+    if avg_band_db > -18 and energy_ratio > 0.25 and peak_db_level > -20:
+        return "near the microphone side"
+    if avg_band_db > -32 and energy_ratio > 0.15:
+        return "same room, nearby area"
+    return "uncertain / distant area"
+
+
+def get_direction_for_strength(mic_direction: int, area_hint: str) -> int:
+    """Map signal strength to a direction relative to the chosen microphone.
+
+    The mic's configured direction (in degrees, 0..360 where 0 = front/North)
+    defines where the microphone is physically pointing. The direction_deg
+    output tells the user which way the sound source is relative to that mic:
+
+      - Strong signal ("near the microphone side") → sound is coming from the
+        direction the mic is pointing. Use the exact configured direction.
+      - Medium signal ("same room, nearby area") → sound is nearby but at a
+        wider angle. Return the mic direction ± some uncertainty; we use the
+        direction as-is since it still indicates the general quadrant.
+      - Weak/uncertain ("uncertain / distant area") → cannot determine
+        direction. Return -1 to indicate unknown.
+    """
+    hint_l = (area_hint or '').lower()
+    if 'uncertain' in hint_l or 'distant' in hint_l:
+        return -1
+    # For any detectable signal, the source direction is relative to
+    # where the selected microphone is oriented/positioned.
+    return mic_direction
+
+
 class AcousticDroneDetector:
     """
     Listens to a microphone and analyses each audio frame with an FFT.
@@ -177,7 +229,7 @@ class AcousticDroneDetector:
       5. Alert fires when CONFIRM_FRAMES consecutive frames all pass.
     """
 
-    def __init__(self, device_index=None, detections_queue=None):
+    def __init__(self, device_index=None, detections_queue=None, mic_direction=0):
         # If no device specified, auto-detect a camera microphone.
         # Preserve explicit 0 device index as a valid selection.
         self.explicit_device_index = device_index is not None
@@ -186,12 +238,17 @@ class AcousticDroneDetector:
         self.running        = False
         self._thread        = None
         self._confirm_count = 0          # consecutive positive frames
+        self.audio_source_label = "unknown microphone"
         self.recent_detections = deque(maxlen=ACOUSTIC_HISTORY)
         self.stats = {
             "frames_analysed": 0,
             "positive_frames": 0,
             "alerts":          0,
         }
+        # Direction (in degrees) that the selected microphone is oriented/pointing.
+        # 0 = front/North, increasing clockwise. User-configurable so that the
+        # direction_deg in detection output is relative to this mic's position.
+        self.mic_direction = mic_direction
 
         # `detections` is a shared queue used by RF + acoustic detectors to
         # publish human-readable detection dictionaries to the main loop.
@@ -207,7 +264,7 @@ class AcousticDroneDetector:
         self._thread.start()
         if not SCIPY_AVAILABLE:
             print("⚠️  SciPy unavailable; using NumPy peak detector fallback.")
-        print("🎙️  Acoustic drone detector running...")
+        print(f"🎙️  Acoustic drone detector running (mic direction: {self.mic_direction}°)...")
         return True
 
     def stop(self):
@@ -260,6 +317,7 @@ class AcousticDroneDetector:
                 device_label = f"device {self.device_index} (explicit)"
             else:
                 device_label = f"device {self.device_index}" if self.device_index is not None else "system default"
+            self.audio_source_label = device_label
             print(f"   Microphone open ({device_label}, "
                   f"{SAMPLE_RATE} Hz, chunk {CHUNK_SIZE})")
             while self.running:
@@ -446,6 +504,17 @@ class AcousticDroneDetector:
             # Compute the dB level of the strongest peak for the alert message
             peak_db_level = np.max(band_db[peaks_idx]) if len(peaks_idx) > 0 else -100
 
+            sound_origin = classify_acoustic_source(best_fund)
+            area_hint = classify_acoustic_area(
+                energy_ratio,
+                avg_band_db,
+                peak_db_level,
+            )
+            # Direction is relative to the selected microphone's configured
+            # orientation (--mic-direction). Strong = exact direction,
+            # weak/uncertain = -1 (unknown).
+            direction_deg = get_direction_for_strength(self.mic_direction, area_hint)
+
             detection = {
                 "source":      "ACOUSTIC",
                 "timestamp":   datetime.now().strftime("%H:%M:%S"),
@@ -453,10 +522,14 @@ class AcousticDroneDetector:
                 "harmonics":   best_count,
                 "energy_pct":  f"{energy_ratio * 100:.1f}%",
                 "peak_db":     f"{peak_db_level:.1f} dBFS",
+                "mic_source":  self.audio_source_label,
+                "sound_origin": sound_origin,
+                "area_hint":   area_hint,
                 "detail":      (f"Harmonic series at {best_fund:.0f} Hz "
                                 f"({best_count} harmonics, "
                                 f"band energy {energy_ratio*100:.1f}%, "
-                                f"peak {peak_db_level:.1f} dBFS)"),
+                                f"peak {peak_db_level:.1f} dBFS). "
+                                f"Likely source: {sound_origin}; area: {area_hint}"),
             }
 
             key = f"acoustic_{int(best_fund)}"
@@ -466,10 +539,35 @@ class AcousticDroneDetector:
                     self.detections.put_nowait(detection)
                 except queue.Full:
                     pass
+                # Human-readable console message
+                dir_str = f" (direction: {direction_deg}° relative to mic)" if direction_deg >= 0 else " (direction: unknown)"
                 print(f"🔊 DRONE DETECTED (ACOUSTIC)! "
                       f"Fund: {best_fund:.0f} Hz | "
                       f"Harmonics: {best_count} | "
-                      f"Band energy: {energy_ratio*100:.1f}%")
+                      f"Band energy: {energy_ratio*100:.1f}% | "
+                      f"Likely source: {sound_origin} | "
+                      f"Area: {area_hint} | "
+                      f"Dir: {direction_deg}° via {self.audio_source_label}")
+
+                # Emit a machine-readable JSON line for external dashboards
+                try:
+                    out = {
+                        'type': 'ACOUSTIC',
+                        'timestamp': datetime.now().strftime('%Y-%m-%dT%H:%M:%S'),
+                        'fundamental_hz': round(best_fund, 1),
+                        'harmonics': best_count,
+                        'energy_pct': round(energy_ratio*100, 1),
+                        'peak_db': round(peak_db_level, 1),
+                        'mic_source': self.audio_source_label,
+                        'sound_origin': sound_origin,
+                        'area_hint': area_hint,
+                        # direction_deg is relative to the selected microphone's
+                        # configured orientation (--mic-direction).
+                        'direction_deg': direction_deg,
+                    }
+                    print(json.dumps(out), flush=True)
+                except Exception:
+                    pass
 
     def print_stats(self):
         s = self.stats
@@ -479,7 +577,8 @@ class AcousticDroneDetector:
             hit_rate = 0.0
         print(f"   🎙️  Frames: {s['frames_analysed']} | "
               f"Positive: {s['positive_frames']} ({hit_rate:.1f}%) | "
-              f"Alerts: {s['alerts']}")
+              f"Alerts: {s['alerts']} | "
+              f"Mic dir: {self.mic_direction}°")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -543,6 +642,26 @@ def list_audio_devices():
     print()
 
 
+def get_audio_devices():
+    """Return a list of available audio input devices as JSON-serializable dicts."""
+    if not PYAUDIO_AVAILABLE:
+        return []
+    import pyaudio
+    pa = pyaudio.PyAudio()
+    devices = []
+    for i in range(pa.get_device_count()):
+        info = pa.get_device_info_by_index(i)
+        if info["maxInputChannels"] > 0:
+            devices.append({
+                'index': i,
+                'name': info['name'],
+                'channels': int(info['maxInputChannels']),
+                'sample_rate': int(info['defaultSampleRate']),
+            })
+    pa.terminate()
+    return devices
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -563,6 +682,7 @@ Examples:
   sudo python3 acoustic_drone_detector.py
   sudo python3 acoustic_drone_detector.py --list-audio
   sudo python3 acoustic_drone_detector.py --audio-device 1
+  sudo python3 acoustic_drone_detector.py --audio-device 1 --mic-direction 0
 
 Acoustic tuning flags (advanced):
   --freq-low / --freq-high   : drone band Hz  (default 80–2000)
@@ -575,6 +695,9 @@ Acoustic tuning flags (advanced):
                         help="List microphone devices and exit")
     parser.add_argument("--audio-device",    type=int, default=None,
                         help="PyAudio device index for microphone (default: auto-detect camera mic, or system default)")
+    parser.add_argument("--mic-direction",   type=int, default=0,
+                        help="Direction (in degrees) the selected microphone is oriented/pointing. "
+                             "0=front, 90=right, 180=back, 270=left (default: 0)")
     parser.add_argument("--freq-low",        type=int, default=DRONE_FREQ_LOW,
                         help=f"Low end of drone frequency band Hz (default {DRONE_FREQ_LOW})")
     parser.add_argument("--freq-high",       type=int, default=DRONE_FREQ_HIGH,
@@ -635,6 +758,7 @@ Acoustic tuning flags (advanced):
     acoustic_detector = AcousticDroneDetector(
         device_index     = args.audio_device,
         detections_queue = shared_queue,
+        mic_direction    = args.mic_direction,
     )
     acoustic_started = acoustic_detector.start()
 
@@ -646,7 +770,7 @@ Acoustic tuning flags (advanced):
 
     try:
         while True:
-            time.sleep(5)
+            time.sleep(0.1)
             print(f"\n── Stats @ {datetime.now().strftime('%H:%M:%S')} ──")
             acoustic_detector.print_stats()
 
