@@ -1043,6 +1043,76 @@ function drawCompass(canvasId, deg, label) {
   }
 }
 
+// ── Server startup check ──────────────────────────────────────────────────
+let serverConnected = false;
+let serverCheckInterval = null;
+
+function showServerUnavailableNotice() {
+  const notice = document.createElement('div');
+  notice.id = 'server-notice';
+  notice.style.cssText = `
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.85); z-index: 9999;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  `;
+  notice.innerHTML = `
+    <div style="
+      background: var(--bg2); border: 1px solid var(--border);
+      border-radius: 12px; padding: 32px; max-width: 480px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    ">
+      <h2 style="color: var(--red); margin-bottom: 12px; font-size: 18px;">
+        ⚠️ Dashboard Server Not Running
+      </h2>
+      <p style="color: var(--muted); margin-bottom: 16px; line-height: 1.5;">
+        The backend server at <code style="background: var(--bg3); padding: 2px 6px; border-radius: 3px;">localhost:9000</code> is not responding.
+      </p>
+      <p style="color: var(--muted); margin-bottom: 20px; line-height: 1.5; font-family: monospace; font-size: 12px;">
+        To start it, run in terminal:<br>
+        <span style="color: var(--cyan);">python3 dashboard_server.py</span>
+      </p>
+      <div style="display: flex; gap: 10px;">
+        <button onclick="checkServer()" style="
+          padding: 8px 16px; background: var(--accent); color: #fff;
+          border: none; border-radius: 6px; cursor: pointer; font-weight: 600;
+        ">Retry Connection</button>
+        <button onclick="document.getElementById('server-notice').remove();" style="
+          padding: 8px 16px; background: transparent; color: var(--muted);
+          border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+        ">Dismiss</button>
+      </div>
+      <p style="color: var(--muted); font-size: 11px; margin-top: 16px;">
+        Dashboard will auto-reconnect every 3 seconds...
+      </p>
+    </div>
+  `;
+  document.body.appendChild(notice);
+}
+
+function checkServer() {
+  fetch('http://localhost:9000/status', { method: 'GET', timeout: 2000 })
+    .then(res => res.json())
+    .then(data => {
+      serverConnected = true;
+      const notice = document.getElementById('server-notice');
+      if (notice) notice.remove();
+      console.log('✓ Dashboard server connected');
+      if (serverCheckInterval) clearInterval(serverCheckInterval);
+    })
+    .catch(err => {
+      serverConnected = false;
+      const existingNotice = document.getElementById('server-notice');
+      if (!existingNotice) {
+        showServerUnavailableNotice();
+      }
+    });
+}
+
+// Check server on page load and every 3 seconds
+checkServer();
+serverCheckInterval = setInterval(checkServer, 3000);
+
 // Open EventSource to receive detection JSON from dashboard_server
 try {
   const es = new EventSource('http://localhost:9000/events');
@@ -1096,9 +1166,22 @@ try {
         const msg = obj.message || obj.msg || JSON.stringify(obj);
         // Choose level by simple heuristics
         const level = /error|failed|warn|exception/i.test(msg) ? 'ERROR' : 'INFO';
+        
+        // Only show logs from enabled sensors (unless it's a SYSTEM message)
+        const srcLower = src.toLowerCase();
+        if (srcLower !== 'system' && srcLower !== 'acoustic' && srcLower !== 'rf' && srcLower !== 'camera') {
+          // Unknown source, always show
+        } else if (srcLower === 'system') {
+          // System messages always shown
+        } else if (!state.sensors[srcLower]) {
+          // Sensor is disabled, skip this log message
+          return;
+        }
+        
         addLog(src, msg, level);
         // Parse acoustic stats lines like: "Frames: 123 | Positive: 5 (4.1%) | Alerts: 2"
-        if (src === 'ACOUSTIC') {
+        // Only update if acoustic sensor is actually enabled
+        if (src === 'ACOUSTIC' && state.sensors.acoustic) {
           try {
             const m = msg.match(/Frames:\s*(\d+)\s*\|\s*Positive:\s*(\d+).*?\|\s*Alerts:\s*(\d+)/i);
             if (m) {

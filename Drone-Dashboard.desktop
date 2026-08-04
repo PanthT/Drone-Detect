@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Drone Detection Dashboard
+Comment=Start the drone detection dashboard server and open the web interface
+Exec=python3 /home/panth/Documents/GitHub/Drone-Detect/start_dashboard.py
+Icon=applications-system
+Terminal=true
+Categories=Science;Engineering;

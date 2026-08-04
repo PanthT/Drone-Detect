@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  drone-dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drone-detection-dashboard
+    ports:
+      - "9000:9000"
+    environment:
+      - FLASK_ENV=production
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Mount audio device (Linux only)
+      - /dev/snd:/dev/snd
+      # Mount for camera/USB devices (Linux only)
+      - /dev/bus/usb:/dev/bus/usb
+      # Mount for shared data (optional)
+      - ./detections:/app/detections
+      - ./recordings:/app/recordings
+    devices:
+      # Allow access to audio devices
+      - /dev/snd
+      # Allow access to camera devices
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+    privileged: false
+    cap_add:
+      - SYS_ADMIN
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - drone-network
+    stdin_open: true
+    tty: true
+
+networks:
+  drone-network:
+    driver: bridge
